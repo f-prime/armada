@@ -38,18 +38,19 @@ def main() -> int:
     status_cmd.set_defaults(op="status", keys=[])
     daemon = argparse.ArgumentParser(add_help=False)
     daemon.add_argument(
-        "--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)"
+        "--host", help="bind host (default: 127.0.0.1)"
     )
     daemon.add_argument(
-        "--port", type=int, default=7318, help="TCP port (default: 7318)"
+        "--port", type=int, help="TCP port (default: 7318)"
     )
     daemon.add_argument(
         "--advertise-host",
         help="reachable hostname to announce to peers (e.g. MagicDNS)",
     )
-    groups.add_parser("daemon", parents=[daemon], help="run a foreground worker").set_defaults(
-        op="daemon", keys=["host", "port"]
-    )
+    worker = groups.add_parser("daemon", parents=[daemon], help="view and control the local worker")
+    worker.add_argument("action", nargs="?", choices=["status", "start", "stop", "restart"])
+    worker.add_argument("--foreground", action="store_true", help="serve in this terminal")
+    worker.set_defaults(op="daemon", keys=["host", "port"])
     groups.add_parser("startup", parents=[daemon], help="start a worker now and at boot").set_defaults(op="startup")
     groups.add_parser("unstartup", help="stop and remove the boot service").set_defaults(op="unstartup")
     fleet = groups.add_parser("peer", aliases=["fleet"]).add_subparsers(required=True)
@@ -120,11 +121,27 @@ def main() -> int:
     if args.op in ("import", "import-gguf") and args.no_local_weights:
         args.keys.append("no_local_weights")
     try:
+        if args.op == "daemon":
+            bind_flags = any(x is not None for x in (args.host, args.port, args.advertise_host))
+            if args.action and args.foreground:
+                parser.error("--foreground cannot be combined with a daemon action")
+            if args.action or not (bind_flags or args.foreground):
+                from .control import control
+
+                control(args.action, args.host, args.port, args.advertise_host)
+                return 0
+            args.host = args.host or "127.0.0.1"
+            args.port = 7318 if args.port is None else args.port
+            if not args.foreground and (os.getenv("SYSTEMD_EXEC_PID") == str(os.getpid()) or
+                                       os.getenv("XPC_SERVICE_NAME", "").startswith("local.armada.worker.")):
+                # Units written before --foreground existed use this legacy invocation.
+                os.environ["_ARMADA_WORKER_MODE"] = "service"
         if args.op in ("startup", "unstartup"):
             from .startup import configure
 
-            print(configure(args.op == "startup", getattr(args, "host", None),
-                            getattr(args, "port", None), getattr(args, "advertise_host", None)))
+            print(configure(args.op == "startup", getattr(args, "host", None) or "127.0.0.1",
+                            7318 if getattr(args, "port", None) is None else args.port,
+                            getattr(args, "advertise_host", None)))
             return 0
         from .runtime import execute
 

@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import plistlib
+import shlex
 import shutil
 import socket
 import subprocess
@@ -42,15 +43,60 @@ def unit_text(argv: list[str]) -> str:
         return '"' + arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
     # The ':' prefix disables systemd environment-variable substitution.
-    return (MARK + "[Unit]\nDescription=Armada worker\n\n[Service]\nExecStart="
+    return (MARK + "[Unit]\nDescription=Armada worker\n\n[Service]\nEnvironment=_ARMADA_WORKER_MODE=service\nExecStart="
             + " ".join(map(quote, [":" + argv[0], *argv[1:]])) + "\nRestart=on-failure\nRestartSec=5\n\n"
             "[Install]\nWantedBy=default.target\n")
+
+
+def unit_path() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user" / UNIT
+
+
+def launch_label() -> str:
+    return f"local.armada.worker.{os.getuid()}"
+
+
+def plist_path() -> Path:
+    return Path("/Library/LaunchDaemons") / (launch_label() + ".plist")
+
+
+def registered_args() -> list[str]:
+    """Read our installed launch command, including pre-control-panel units."""
+    if sys.platform == "darwin":
+        path = plist_path()
+        if path.exists():
+            with path.open("rb") as f:
+                return list(plistlib.load(f)["ProgramArguments"])
+    elif sys.platform.startswith("linux"):
+        path = unit_path()
+        if path.exists():
+            text = path.read_text()
+            if text.startswith(MARK):
+                line = next(line for line in text.splitlines() if line.startswith("ExecStart="))
+                return shlex.split(line.removeprefix("ExecStart=").replace("%%", "%"))
+    return []
+
+
+def service_action(action: str) -> None:
+    if sys.platform != "darwin":
+        run("systemctl", "--user", action, UNIT)
+        return
+    target = "system/" + launch_label()
+    loaded = subprocess.run(["launchctl", "print", target], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL).returncode == 0
+    if action == "stop":
+        if loaded:
+            run("sudo", "launchctl", "bootout", target)
+    elif not loaded:
+        run("sudo", "launchctl", "bootstrap", "system", str(plist_path()))
+    elif action == "restart":
+        run("sudo", "launchctl", "kickstart", "-k", target)
 
 
 def linux(argv: list[str], host: str, port: int) -> None:
     import pwd
 
-    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user" / UNIT
+    path = unit_path()
     ctl = ["systemctl", "--user"]
     if path.exists() and not path.read_text().startswith(MARK):
         raise ValueError(f"{path} is not managed by Armada")
@@ -77,8 +123,8 @@ def mac(argv: list[str], host: str, port: int) -> None:
     import pwd
 
     user = pwd.getpwuid(os.getuid())
-    label = f"local.armada.worker.{user.pw_uid}"
-    path = Path("/Library/LaunchDaemons") / (label + ".plist")
+    label = launch_label()
+    path = plist_path()
     target = "system/" + label
     loaded = subprocess.run(["launchctl", "print", target], stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL).returncode == 0
@@ -91,7 +137,8 @@ def mac(argv: list[str], host: str, port: int) -> None:
             run("sudo", "rm", str(path))
         return
     data = dict(Label=label, UserName=user.pw_name, ProgramArguments=argv,
-                EnvironmentVariables={"HOME": user.pw_dir}, KeepAlive=True, ThrottleInterval=5)
+                 EnvironmentVariables={"HOME": user.pw_dir, "_ARMADA_WORKER_MODE": "service"},
+                 KeepAlive=True, ThrottleInterval=5)
     with tempfile.NamedTemporaryFile() as f:
         f.write(plistlib.dumps(data))
         f.flush()
@@ -142,7 +189,7 @@ def configure(install: bool, host: str | None, port: int | None, advertise: str 
         executable = shutil.which(sys.argv[0])
         if not executable:
             raise ValueError("run startup using the installed armada command")
-        argv = [os.path.abspath(executable), "daemon", "--home", str(home().resolve()),
+        argv = [os.path.abspath(executable), "daemon", "--foreground", "--home", str(home().resolve()),
                 "--host", host, "--port", str(port)]
         if advertise:
             argv.extend(["--advertise-host", advertise])

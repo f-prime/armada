@@ -1,0 +1,308 @@
+# Armada usage guide
+
+Armada is an experimental CLI for running a language model across machines you
+own. It splits the model by layer: each worker stores its own weights and runs
+those layers on its CPU. You can send a prompt to any peer. Splitting a model
+lets you spread its storage and compute across machines; it does not guarantee
+faster generation.
+
+**What works today:** Linux multi-daemon inference is integration-tested.
+macOS has native RAM and GPU reporting; a physical mixed Linux/Mac inference
+benchmark is not yet published. GPU detection is for inventory, not execution.
+The NumPy backend supports legacy `llama2.c` completions and a subset of
+`qwen3moe` GGUF v3 checkpoints with Qwen byte-level BPE. The chat API targets
+Qwen ChatML instruction models; arbitrary GGUF architectures and chat templates
+are not supported.
+
+## Five-minute quickstart: two peers and TinyStories
+
+**Use two trusted machines on an encrypted private network**, such as a
+Tailscale tailnet. Enrolled peers share fleet administration rights, including
+the ability to delete models. Peer RPC uses HTTP bearer credentials; do not
+expose the daemon to the public internet. An inference-only client key does
+not grant peer administration rights.
+
+**1. Install and start a worker on each machine.** Install
+[uv](https://docs.astral.sh/uv/) and run these commands from the checkout.
+Replace the bind address with **that machine's own** private IPv4 address. If
+using Tailscale, the command below selects it for you:
+
+```sh
+uv tool install --python 3.12 .
+armada daemon --foreground --host "$(tailscale ip -4)" --port 5242
+```
+
+Leave both daemons running. Each prints `Armada listening on ...; peer address ...`.
+Use a second terminal on each machine for the remaining steps.
+
+**Manage the local worker:** `armada daemon` opens a terminal panel showing
+ON/OFF, bind host, port, and boot registration. Use the displayed controls
+to start, stop, or restart; quitting leaves the worker as it is. In scripts
+or when piped, the same command prints status and exits. `armada status`
+still reports the whole fleet.
+
+```sh
+armada daemon start --host "$(tailscale ip -4)" --port 5242
+armada daemon status
+armada daemon restart
+armada daemon stop
+```
+
+These actions do not change boot registration. Without `startup`, `start`
+launches a detached worker, logs to `daemon.log` in the Armada home, and
+reuses the last successful bind settings unless overridden. With `startup`,
+the panel controls the installed service instead; use `startup` to change
+its settings. `--home` or `ARMADA_HOME` selects a specific local worker.
+`armada daemon --foreground` runs in the terminal. Older commands such as
+`armada daemon --port 5242` still run in the foreground.
+
+**Start on boot instead:** Stop the foreground worker with Ctrl+C, then run
+the following under the same account on each machine:
+
+```sh
+armada startup --host "$(tailscale ip -4)" --port 5242
+armada status
+```
+
+`startup` starts the worker immediately and saves its arguments for boot.
+Use the same `--home` (or `ARMADA_HOME`), `--host`, `--port`, and
+`--advertise-host` as your foreground daemon. Without overrides it serves
+`127.0.0.1:7318`. Run `startup` again to update the service. Keep the
+installed executable at its original path. The service does not copy your
+shell environment (for example, `ARMADA_API_KEY` or `ARMADA_RPC_TIMEOUT`).
+
+- **Linux:** Requires systemd. Installs `armada-worker.service` for the
+  current user and enables lingering so login is not required. If policy
+  denies lingering, run `sudo loginctl enable-linger "$USER"` and retry.
+  View logs with `journalctl --user -u armada-worker`.
+- **macOS:** Installs a system LaunchDaemon running as your account.
+  Run Armada as yourself; it invokes `sudo` for service management.
+- **Windows:** Run both commands **inside a systemd-enabled WSL2 distro**
+  from a Windows terminal opened as administrator under the distro owner's
+  account. Requires WSL interoperability with Windows PowerShell. A Windows
+  Task Scheduler boot task launches the distro and stays attached to the
+  worker service. Use a bind address reachable inside WSL.
+
+Run `armada unstartup` to stop the managed worker and remove its boot
+registration. Node identity, peers, and models are preserved. On Linux/WSL,
+user lingering stays enabled because other services may depend on it.
+
+**2. Pair once.** On machine B:
+
+```sh
+armada peer pairing-code
+```
+
+On machine A, replace `MACHINE_B_PRIVATE_IP` with B's address, enter the code
+when prompted, and check that `armada status` lists **2 nodes**:
+
+```sh
+armada peer add MACHINE_B_PRIVATE_IP:5242
+armada status
+```
+
+**3. Import a small model and generate text.** On either machine:
+
+```sh
+repo=https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K
+armada model add "$repo/stories260K.bin" --tokenizer "$repo/tok512.bin" --name stories
+armada model status stories
+armada run stories 'Once upon a time' -n 32
+```
+
+`model status` should show `All layer owners reachable`, with layers and stored
+bytes on both peers. `run` should print a story continuation such as
+`, there was a little girl named Lily`. That checks both workers participated.
+
+### Operating a fleet
+
+Keep `~/.armada/node.json` private. Override the data directory with `ARMADA_HOME`
+or `--home`. Use `daemon --advertise-host` to announce a DNS name or
+`peer add --return-address HOST:PORT` to specify how B reaches A. Node IDs
+persist across address changes. Upgrade the whole fleet together, restart each
+daemon with its existing home, and let the peers sync.
+
+In a terminal, `model add` shows acknowledged transfer bytes, speed, and
+estimated transfer time remaining. For split GGUF imports the ETA is per part.
+Verification and publication follow the transfer. Progress goes to stderr;
+stdout still contains the JSON result.
+
+Run `armada model list` for an alphabetical inventory of fleet models and the
+number of distinct peers assigned layers for each. Use `armada model list --json`
+for scripts. The inventory includes models with offline peers; use
+`armada model status NAME` to see which peers own each layer range and whether
+they are reachable. **Stored** shows the size of that model's local shard files
+on every fleet peer (including peers with no assigned layers). `0 B` means no
+bytes reported for that model; `Unknown` means no measurement. The summary
+labels partial totals. Add `--json` for exact `storage_bytes_by_peer` values
+keyed by full node ID, with `null` for unknown sizes.
+
+`armada model delete NAME` removes the model from the fleet catalog and deletes
+its Armada shard directories. The source checkpoint is untouched. Use `--json`
+for the model ID and lists of confirmed and pending peers. Offline peers clean
+up on sync; reimporting the same name creates a separate generation. Upgrade
+all daemons for fleet-wide deletion support.
+
+Pass `--no-local-weights` to `model add` to keep the importing machine out of
+the placement. Once the manifest is shared, it can go offline.
+
+### Redistribute after a worker goes offline or a new peer joins
+
+```sh
+armada model status stories
+armada model redistribute stories
+# Optional when the recorded source is gone or only exists on the original importer:
+armada model redistribute stories --source /models/stories.bin --tokenizer /models/tok512.bin
+```
+
+Run this on any peer. Armada plans a contiguous placement against available
+disk on reachable machines, hard-links weights staying on the same machine,
+copies moving weights in chunks, and recovers missing weights from the recorded
+checkpoint or your override. Local source paths must be readable on the peer
+running the command. SHA-256 digests recorded at import pin the weight contents,
+including when the original URL is mutable. Legacy manifests without a digest
+inventory need all original owners online for their first redistribution.
+
+The replacement is verified before the local manifest switches generations.
+Peers exchange the new manifest and remove superseded files, including peers
+returning after an outage. Missing source, insufficient disk, or mismatched
+weights during staging leave the old placement intact. There are no permanent
+replicas or automatic failover. The disk planner does not guarantee sufficient
+inference RAM for a particular context length. Finish active requests before
+redistributing; run one placement operation per model at a time. Catalog sync is
+eventual, not a distributed transaction.
+
+### Import Qwen3-Coder GGUF
+
+Pass a local GGUF path or HTTPS URL without `--tokenizer`. For numbered splits,
+pass the **first** shard; Armada reads all parts sequentially. For example:
+
+```sh
+repo=https://huggingface.co/unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF/resolve/main/Q4_K_M
+armada model add "$repo/Qwen3-Coder-480B-A35B-Instruct-Q4_K_M-00001-of-00006.gguf" --name coder
+armada run coder 'def fibonacci(n):' -n 8
+```
+
+The six Q4_K_M shard headers were inspected: **290,052,841,472 bytes of
+weight payload**, before filesystem overhead. Budget per node for its assigned
+layers plus input/output tensors on the end nodes. Disk is checked per shard.
+The full 480B model has **not** been run on a physical fleet.
+
+Armada sends 8 MiB chunks, checks their SHA-256 on receipt, and persists each
+tensor only on its owner. At inference it memory-maps those files, dequantizes
+matrix rows in tiles, and evaluates only the routed experts per token.
+Supported tensor encodings are F32/F16/BF16, Q8_0, Q4_0/1, Q5_0/1 and
+Q2_K through Q6_K. Use an unscaled-RoPE, separate-Q/K/V, untied-output
+`qwen3moe` checkpoint. This does not implement arbitrary GGUF architectures.
+
+Start with short prompts: prefix recomputation and quadratic attention make
+long contexts expensive. For slow runs set `ARMADA_RPC_TIMEOUT` (seconds,
+default 300) on the CLI and daemons.
+
+### Legacy importer and placement
+
+Local paths also work. The legacy importer reads a remote checkpoint sequentially
+without saving it in full. It buffers and converts one tensor at a time, so
+the largest individual matrix and conversion scratch must fit in RAM.
+Placement divides layers by count across enrolled nodes and checks free disk;
+it does not yet optimize for heterogeneous RAM. Input embeddings and the
+output head live on the end stages (tied weights are duplicated if needed).
+`armada status` (also `armada peer status` or `armada fleet status`) shows a
+per-node summary of RAM, disk, CPU load, GPUs, and active models. Linux peers
+discover GPUs through sysfs and enrich NVIDIA data with `nvidia-smi` when
+available. Macs use System Profiler; Apple Silicon reports shared memory rather
+than dedicated VRAM. A dash means the metric was not reported.
+Use `armada status --json` for the full machine-readable snapshot, including
+peer endpoints, model metadata, and persisted shard sizes.
+
+Restart daemons with the same data directories. Only the requesting peer and
+workers holding required stages need to be online for inference.
+The reference backend recomputes the prefix and exchanges JSON activations;
+it favors a small, inspectable implementation over throughput.
+
+## OpenAI-compatible inference API and OpenCode
+
+Create an inference key on any enrolled node. The token is shown only on
+creation or rotation. For example, to set it in your client shell:
+
+```sh
+armada key create --name opencode --json  # copy the token into ARMADA_API_KEY on the client
+armada key list
+armada key show KEY_ID
+armada key rename KEY_ID editor
+armada key rotate KEY_ID  # update clients with the replacement token
+armada key revoke KEY_ID
+```
+
+All key commands accept `--json`. Managed keys work on every updated daemon
+without setting a daemon environment variable. Only token hashes and metadata
+are replicated. Mutations report acknowledged and pending nodes; an offline
+node can accept an old credential until it syncs. Newly enrolled nodes receive
+the registry, and revocations persist across restarts and stale peer updates.
+Keys grant inference access only. An explicitly configured daemon-side
+`ARMADA_API_KEY` remains a separate local credential unaffected by these commands.
+
+```sh
+base=http://127.0.0.1:7318/v1  # use your daemon's actual address
+curl "$base/models" -H "Authorization: Bearer $ARMADA_API_KEY"
+curl "$base/completions" -H "Authorization: Bearer $ARMADA_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"stories","prompt":"Once upon a time","max_tokens":16}'
+curl -N "$base/chat/completions" -H "Authorization: Bearer $ARMADA_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"coder","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+```
+
+`GET /v1/models` lists fleet catalog names, including models whose owners are
+offline. Chat requires a Qwen ChatML instruction model, such as a supported
+Qwen3-Coder GGUF. The chat endpoint supports text messages, streaming and
+non-streaming responses, token limits, usage, and automatic function calls
+with tool-result history. Generation is greedy; custom sampling is not
+implemented. TinyStories is a plain completion model.
+
+For OpenCode V2, add this custom provider to `opencode.jsonc`. Set the base
+URL as seen from the OpenCode service, and use your registered model name:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "armada": {
+      "name": "Armada Fleet",
+      "env": ["ARMADA_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:7318/v1" },
+      "models": { "coder": { "name": "Fleet Coder", "capabilities": {
+        "tools": true, "input": ["text"], "output": ["text"]
+      } } }
+    }
+  }
+}
+```
+
+Set the model's `limit.context` to its `qwen.ctx` value from `armada model status coder --json`
+and choose a `limit.output` within that window. Make the inference key available to OpenCode and select `armada/coder` in
+`/models`. The client executes requested functions and sends their results
+back to the daemon.
+
+## Reproduce the integration check
+
+```sh
+uv sync --locked
+uv run mypy
+repo=https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K
+curl -fL "$repo/stories260K.bin" -o /tmp/stories260K.bin
+curl -fL "$repo/tok512.bin" -o /tmp/tok512.bin
+uv run python tests/two_nodes.py /tmp/stories260K.bin /tmp/tok512.bin
+```
+
+The check starts independent loopback daemons, verifies disjoint decoder weights,
+tests recovery from a missing owner, failed staging, offline importer, stale
+weight cleanup, and endpoint changes, and compares against an unpartitioned run.
+
+To test the GGUF backend with no external model download, run
+`uv run python tests/gguf_nodes.py`. The development environment includes
+llama-cpp-python as an independent test oracle. The test builds
+a deterministic split Q8_0 MoE fixture, compares worker-local logits against
+llama.cpp for three prompts, removes the GGUF sources, restarts both workers,
+and checks greedy completions against both single-node Armada and llama.cpp.

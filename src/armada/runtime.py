@@ -655,12 +655,23 @@ def execute(args: list[str]) -> object:
             initialize(node, addr, advertise)
             with ThreadingHTTPServer((host, port), Handler) as server:
                 save(path, node)
+                token = secrets.token_hex(16)
+                save(home() / "daemon.json", dict(host=host, port=port,
+                     advertise_host=a[2] if len(a) > 2 else None, token=token,
+                     mode=os.environ.get("_ARMADA_WORKER_MODE", "foreground")))
                 threading.Thread(target=gossip, daemon=True).start()
                 print(
                     f"Armada listening on {bind_addr}; peer address {node['peers'][node['uid']]['endpoint']}",
                     flush=True,
                 )
-                server.serve_forever()
+                # A local stop request names this exact run; stale requests cannot
+                # stop a replacement process (including after a crash or reboot).
+                server.timeout = 0.25
+                request = home() / ("stop-" + token)
+                while not request.exists():
+                    server.handle_request()
+                request.unlink()
+                return "Armada stopped."
     s = state()
     if op == "pair":
         return rpc(s["addr"], "pair")
