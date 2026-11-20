@@ -684,10 +684,10 @@ def execute(args: list[str]) -> object:
                 return_address=a[1] if len(a) > 1 else None,
             ),
         )
-    if op == "redistribute":
-        return redistribute(*a)
-    if op in ("import", "import-gguf"):
+    if op in ("import", "import-gguf", "redistribute"):
         with terminal_progress() as progress:
+            if op == "redistribute":
+                return redistribute(*a, progress=progress)
             if progress:
                 progress.phase(f"Preparing {a[0]}…")
             if op == "import":

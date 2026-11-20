@@ -14,6 +14,7 @@ import numpy as np
 
 from .common import check, home, ident, open_source, readn, rpc, state
 from .mesh import online, publish
+from .progress import Progress
 from .schema import Artifact, Fields, Model
 
 CHUNK = 8 * 2**20
@@ -202,16 +203,24 @@ def recovery(
                 yield key, j, raw[j : j + CHUNK]
 
 
-def redistribute(name: str, source: str = "", tokenizer: str = "") -> Model:
+def redistribute(
+    name: str, source: str = "", tokenizer: str = "", *, progress: Progress | None = None
+) -> Model:
     old = state()["models"][name]
+    if progress:
+        progress.phase(f"Finding reachable peers for {name}…")
     nodes = online()
     if "files" not in old:
+        if progress:
+            progress.phase("Indexing existing weights…")
         check(
             set(old["owners"]) <= set(nodes),
             "legacy manifest: bring all original owners online once to index weights",
         )
         verify(old, list(set(old["owners"])), {})
     files = old["files"]
+    if progress:
+        progress.phase("Checking peer inventories and planning placement…")
     local = {
         p: set(cast(Fields, rpc(p, "inventory", dict(id=old["id"], hashes=False))))
         for p in nodes
@@ -222,16 +231,30 @@ def redistribute(name: str, source: str = "", tokenizer: str = "") -> Model:
     if tokenizer:
         m["tokenizer_source"] = location(tokenizer)
     targets = list(dict.fromkeys(m["owners"]))
-    missing: set[str] = set()
+    sources = {k: next((p for p in nodes if k in local[p]), None) for k in files}
+    missing = {k for k, src in sources.items() if src is None}
+    if progress:
+        reuse = transfer = 0
+        for k, f in files.items():
+            for p in destinations(m, k, f):
+                if k in local[p]:
+                    reuse += 1
+                elif k not in missing:
+                    transfer += f["size"]
+        if reuse:
+            progress.phase(f"Reusing {reuse} local file copies…")
+        if transfer:
+            progress.start(f"Redistributing {name} · peers: {len(targets)}", transfer)
 
     def send(p: str, k: str, j: int, data: bytes) -> None:
         rpc(p, f"chunk/{m['id']}/{k}/{j}/{hashlib.sha256(data).hexdigest()}", body=data)
+        if progress:
+            progress.advance(len(data))
 
     try:
         for k, f in files.items():
-            src = next((p for p in nodes if k in local[p]), None)
+            src = sources[k]
             if src is None:
-                missing.add(k)
                 continue
             for p in destinations(m, k, f):
                 if k in local[p]:
@@ -249,6 +272,11 @@ def redistribute(name: str, source: str = "", tokenizer: str = "") -> Model:
                         )
                         send(p, k, j, data)
         if missing:
+            if progress:
+                progress.start(
+                    f"Recovering {len(missing)} files from source…",
+                    sum(files[k]["size"] * len(destinations(m, k, files[k])) for k in missing),
+                )
             try:
                 for k, j, data in recovery(
                     m, missing, m.get("source", ""), m.get("tokenizer_source", "")
@@ -260,6 +288,8 @@ def redistribute(name: str, source: str = "", tokenizer: str = "") -> Model:
                     f"cannot recover {len(missing)} files (including {min(missing)}); supply --source / --tokenizer: {exc}"
                 ) from exc
         if m.get("backend") == "qwen3moe":
+            if progress:
+                progress.phase("Finalizing manifests…")
             for p in targets:
                 manifest = {
                     f["tensor"][0]: [k, *f["tensor"][1:]]
@@ -272,11 +302,17 @@ def redistribute(name: str, source: str = "", tokenizer: str = "") -> Model:
                     f"weight/{m['id']}/manifest/{hashlib.sha256(b).hexdigest()}",
                     body=b,
                 )
+        if progress:
+            progress.phase("Verifying weights…")
         verify(m, targets, files)
     except Exception:
         for p in targets:
             with contextlib.suppress(OSError, ValueError):
                 rpc(p, "discard", dict(id=m["id"]))
         raise
+    if progress:
+        progress.phase("Publishing model…")
     publish(name, m, old["id"])
+    if progress:
+        progress.phase(f"{name} is ready.")
     return m

@@ -1,52 +1,86 @@
 # Armada
 
-Armada is a personal distributed inference CLI. This prototype pools Linux
-machines by assigning contiguous transformer layers to workers. Its Python CLI
-and NumPy CPU backend run in one uv-managed environment. Each worker retains its own quantized weights
-on disk and evaluates its layers locally. Every peer keeps a copy of the model
-catalog. The peer receiving a prompt drives that request; there is no permanent coordinator.
+Armada is an experimental CLI for running a language model across machines you
+own. It splits the model by layer: each worker stores its own weights and runs
+those layers on its CPU. You can send a prompt to any peer. Splitting a model
+lets you spread its storage and compute across machines; it does not guarantee
+faster generation.
 
-**Supported today:** `qwen3moe` GGUF v3 checkpoints with Qwen byte-level BPE,
-and legacy `llama2.c` checkpoints with a binary tokenizer. This is a CPU
-completion backend; there is no GPU execution or chat-template handling.
+**What works today:** Linux multi-daemon inference is integration-tested.
+macOS has native RAM and GPU reporting; a physical mixed Linux/Mac inference
+benchmark is not yet published. GPU detection is for inventory, not execution.
+The NumPy backend supports legacy `llama2.c` completions and a subset of
+`qwen3moe` GGUF v3 checkpoints with Qwen byte-level BPE. The chat API targets
+Qwen ChatML instruction models; arbitrary GGUF architectures and chat templates
+are not supported.
 
-## Try it
+## Five-minute quickstart: two peers and TinyStories
 
-On each Linux machine, install [uv](https://docs.astral.sh/uv/) and run
-`uv tool install --python 3.12 .` from this checkout. This installs `armada`
-and both CPU backends. For development, run `uv sync --locked`, then
-`uv run armada --help`. Run the foreground daemon on each machine:
+**Use two trusted machines on an encrypted private network**, such as a
+Tailscale tailnet. Enrolled peers share fleet administration rights, including
+the ability to delete models. Peer RPC uses HTTP bearer credentials; do not
+expose the daemon to the public internet. An inference-only client key does
+not grant peer administration rights.
 
-```sh
-# On each machine
-armada daemon --host 0.0.0.0 --port 5242
-```
-
-`--host 0.0.0.0` listens on all IPv4 interfaces. Armada prints the concrete
-peer endpoint it selected. Use `--advertise-host machine.tailnet-name.ts.net`
-to advertise a DNS name independently of the bind address. A persistent node
-ID owns weights, so changing hostnames, interfaces, or ports does not move them.
-Armada uses HTTP bearer
-authentication; use an encrypted private network for traffic between hosts.
-Keep `~/.armada/node.json` private. Override the data directory with `ARMADA_HOME`
-or `--home`. When upgrading, stop the old daemon and restart the installed CLI
-with the same home. Upgrade the whole fleet together: the new daemons migrate
-the old directory/catalog and gossip it to the old workers. Let the former
-coordinator and workers meet once after the upgrade.
+**1. Install and start a worker on each machine.** Install
+[uv](https://docs.astral.sh/uv/) and run these commands from the checkout.
+Replace the bind address with **that machine's own** private IPv4 address. If
+using Tailscale, the command below selects it for you:
 
 ```sh
-armada peer pairing-code              # on the new machine
-# On any existing peer, enter the new machine's code:
-armada peer add worker.tailnet-name.ts.net:5242 --return-address laptop.tailnet-name.ts.net:5242
-armada peer status
+uv tool install --python 3.12 .
+armada daemon --host "$(tailscale ip -4)" --port 5242
 ```
 
-`--return-address` is optional. Hostnames are stored without resolving them to
-permanent IPs. No fleet initialization is needed. Endpoint and catalog updates
-spread between reachable peers; at least one known endpoint must be reachable
-to exchange changes. `fleet` remains an alias for `peer`.
+Leave both daemons running. Each prints `Armada listening on ...; peer address ...`.
+Use a second terminal on each machine for the remaining steps.
 
-From any peer:
+**Start on boot instead:** Stop the foreground worker with Ctrl+C, then run
+the following under the same account on each machine:
+
+```sh
+armada startup --host "$(tailscale ip -4)" --port 5242
+armada status
+```
+
+`startup` starts the worker immediately and saves its arguments for boot.
+Use the same `--home` (or `ARMADA_HOME`), `--host`, `--port`, and
+`--advertise-host` as your foreground daemon. Without overrides it serves
+`127.0.0.1:7318`. Run `startup` again to update the service. Keep the
+installed executable at its original path. The service does not copy your
+shell environment (for example, `ARMADA_API_KEY` or `ARMADA_RPC_TIMEOUT`).
+
+- **Linux:** Requires systemd. Installs `armada-worker.service` for the
+  current user and enables lingering so login is not required. If policy
+  denies lingering, run `sudo loginctl enable-linger "$USER"` and retry.
+  View logs with `journalctl --user -u armada-worker`.
+- **macOS:** Installs a system LaunchDaemon running as your account.
+  Run Armada as yourself; it invokes `sudo` for service management.
+- **Windows:** Run both commands **inside a systemd-enabled WSL2 distro**
+  from a Windows terminal opened as administrator under the distro owner's
+  account. Requires WSL interoperability with Windows PowerShell. A Windows
+  Task Scheduler boot task launches the distro and stays attached to the
+  worker service. Use a bind address reachable inside WSL.
+
+Run `armada unstartup` to stop the managed worker and remove its boot
+registration. Node identity, peers, and models are preserved. On Linux/WSL,
+user lingering stays enabled because other services may depend on it.
+
+**2. Pair once.** On machine B:
+
+```sh
+armada peer pairing-code
+```
+
+On machine A, replace `MACHINE_B_PRIVATE_IP` with B's address, enter the code
+when prompted, and check that `armada status` lists **2 nodes**:
+
+```sh
+armada peer add MACHINE_B_PRIVATE_IP:5242
+armada status
+```
+
+**3. Import a small model and generate text.** On either machine:
 
 ```sh
 repo=https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K
@@ -54,6 +88,18 @@ armada model add "$repo/stories260K.bin" --tokenizer "$repo/tok512.bin" --name s
 armada model status stories
 armada run stories 'Once upon a time' -n 32
 ```
+
+`model status` should show `All layer owners reachable`, with layers and stored
+bytes on both peers. `run` should print a story continuation such as
+`, there was a little girl named Lily`. That checks both workers participated.
+
+### Operating a fleet
+
+Keep `~/.armada/node.json` private. Override the data directory with `ARMADA_HOME`
+or `--home`. Use `daemon --advertise-host` to announce a DNS name or
+`peer add --return-address HOST:PORT` to specify how B reaches A. Node IDs
+persist across address changes. Upgrade the whole fleet together, restart each
+daemon with its existing home, and let the peers sync.
 
 In a terminal, `model add` shows acknowledged transfer bytes, speed, and
 estimated transfer time remaining. For split GGUF imports the ETA is per part.

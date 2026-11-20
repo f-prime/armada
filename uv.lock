@@ -17,6 +17,10 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+checks = [
+    { name = "mypy" },
+    { name = "types-regex" },
+]
 dev = [
     { name = "llama-cpp-python" },
     { name = "mypy" },
@@ -31,6 +35,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+checks = [
+    { name = "mypy" },
+    { name = "types-regex" },
+]
 dev = [
     { name = "llama-cpp-python", specifier = "==0.3.37" },
     { name = "mypy" },

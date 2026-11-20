@@ -36,7 +36,7 @@ def main() -> int:
     status_cmd = groups.add_parser("status", help="show the fleet summary")
     status_cmd.add_argument("--json", action="store_true", help="print the full fleet snapshot")
     status_cmd.set_defaults(op="status", keys=[])
-    daemon = groups.add_parser("daemon", help="run a foreground worker")
+    daemon = argparse.ArgumentParser(add_help=False)
     daemon.add_argument(
         "--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)"
     )
@@ -47,7 +47,11 @@ def main() -> int:
         "--advertise-host",
         help="reachable hostname to announce to peers (e.g. MagicDNS)",
     )
-    daemon.set_defaults(op="daemon", keys=["host", "port"])
+    groups.add_parser("daemon", parents=[daemon], help="run a foreground worker").set_defaults(
+        op="daemon", keys=["host", "port"]
+    )
+    groups.add_parser("startup", parents=[daemon], help="start a worker now and at boot").set_defaults(op="startup")
+    groups.add_parser("unstartup", help="stop and remove the boot service").set_defaults(op="unstartup")
     fleet = groups.add_parser("peer", aliases=["fleet"]).add_subparsers(required=True)
     for name, op, keys in [
         ("add", "add", ["address"]),
@@ -115,9 +119,15 @@ def main() -> int:
         args.keys.append("tokenizer")
     if args.op in ("import", "import-gguf") and args.no_local_weights:
         args.keys.append("no_local_weights")
-    from .runtime import execute
-
     try:
+        if args.op in ("startup", "unstartup"):
+            from .startup import configure
+
+            print(configure(args.op == "startup", getattr(args, "host", None),
+                            getattr(args, "port", None), getattr(args, "advertise_host", None)))
+            return 0
+        from .runtime import execute
+
         result = execute([args.op, *(str(getattr(args, k)) for k in args.keys)])
         if args.op == "status" and not args.json and isinstance(result, dict):
             from .status import format_status
