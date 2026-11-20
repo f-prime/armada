@@ -1,6 +1,6 @@
 # Armada
 
-![Armada: One model, split across your machines. A laptop, mini PC, and desktop each run a different group of layers.](armada-banner.png)
+![Armada: One model, split across your machines. Three sailing ships travel in formation.](armada-banner.png)
 
 Armada is an experimental CLI that runs a language model across machines you own.
 Each worker stores and runs a group of layers on its CPU. You can send a prompt
