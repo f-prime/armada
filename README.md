@@ -3,8 +3,8 @@
 Armada is a personal distributed inference CLI. This prototype pools Linux
 machines by assigning contiguous transformer layers to workers. Its Python CLI
 and NumPy CPU backend run in one uv-managed environment. Each worker retains its own quantized weights
-on disk and evaluates its layers locally. The coordinator keeps the fleet catalog;
-it does not assemble the model to answer prompts.
+on disk and evaluates its layers locally. Every peer keeps a copy of the model
+catalog. The peer receiving a prompt drives that request; there is no permanent coordinator.
 
 **Supported today:** `qwen3moe` GGUF v3 checkpoints with Qwen byte-level BPE,
 and legacy `llama2.c` checkpoints with a binary tokenizer. This is a CPU
@@ -18,29 +18,35 @@ and both CPU backends. For development, run `uv sync --locked`, then
 `uv run armada --help`. Run the foreground daemon on each machine:
 
 ```sh
-# Coordinator
-armada daemon --host 100.64.0.1 --port 7318
-# Second machine, in a different terminal/on that host
-armada daemon --host 100.64.0.2 --port 7318
+# On each machine
+armada daemon --host 0.0.0.0 --port 5242
 ```
 
 `--host 0.0.0.0` listens on all IPv4 interfaces. Armada prints the concrete
-fleet address it selected (or reuses the existing node address on restart).
-Use a specific `--host` to select a particular LAN or Tailscale interface.
+peer endpoint it selected. Use `--advertise-host machine.tailnet-name.ts.net`
+to advertise a DNS name independently of the bind address. A persistent node
+ID owns weights, so changing hostnames, interfaces, or ports does not move them.
 Armada uses HTTP bearer
 authentication; use an encrypted private network for traffic between hosts.
 Keep `~/.armada/node.json` private. Override the data directory with `ARMADA_HOME`
 or `--home`. When upgrading, stop the old daemon and restart the installed CLI
-with the same home and listen address; existing membership and weights are reused.
+with the same home. Upgrade the whole fleet together: the new daemons migrate
+the old directory/catalog and gossip it to the old workers. Let the former
+coordinator and workers meet once after the upgrade.
 
 ```sh
-armada fleet init home                 # on coordinator
-armada fleet pairing-code              # on second machine
-armada fleet add 100.64.0.2            # on coordinator; enter second machine's code
-armada fleet status
+armada peer pairing-code              # on the new machine
+# On any existing peer, enter the new machine's code:
+armada peer add worker.tailnet-name.ts.net:5242 --return-address laptop.tailnet-name.ts.net:5242
+armada peer status
 ```
 
-From either enrolled machine:
+`--return-address` is optional. Hostnames are stored without resolving them to
+permanent IPs. No fleet initialization is needed. Endpoint and catalog updates
+spread between reachable peers; at least one known endpoint must be reachable
+to exchange changes. `fleet` remains an alias for `peer`.
+
+From any peer:
 
 ```sh
 repo=https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K
@@ -48,6 +54,35 @@ armada model add "$repo/stories260K.bin" --tokenizer "$repo/tok512.bin" --name s
 armada model status stories
 armada run stories 'Once upon a time' -n 32
 ```
+
+Pass `--no-local-weights` to `model add` to keep the importing machine out of
+the placement. Once the manifest is shared, it can go offline.
+
+### Redistribute after a worker goes offline or a new peer joins
+
+```sh
+armada model status stories
+armada model redistribute stories
+# Optional when the recorded source is gone or only exists on the original importer:
+armada model redistribute stories --source /models/stories.bin --tokenizer /models/tok512.bin
+```
+
+Run this on any peer. Armada plans a contiguous placement against available
+disk on reachable machines, hard-links weights staying on the same machine,
+copies moving weights in chunks, and recovers missing weights from the recorded
+checkpoint or your override. Local source paths must be readable on the peer
+running the command. SHA-256 digests recorded at import pin the weight contents,
+including when the original URL is mutable. Legacy manifests without a digest
+inventory need all original owners online for their first redistribution.
+
+The replacement is verified before the local manifest switches generations.
+Peers exchange the new manifest and remove superseded files, including peers
+returning after an outage. Missing source, insufficient disk, or mismatched
+weights during staging leave the old placement intact. There are no permanent
+replicas or automatic failover. The disk planner does not guarantee sufficient
+inference RAM for a particular context length. Finish active requests before
+redistributing; run one placement operation per model at a time. Catalog sync is
+eventual, not a distributed transaction.
 
 ### Import Qwen3-Coder GGUF
 
@@ -87,8 +122,8 @@ output head live on the end stages (tied weights are duplicated if needed).
 `fleet status` reports available RAM, disk, CPU load, NVIDIA GPU memory where
 available, persisted bytes per model ID, and active stage requests.
 
-Restart daemons with the same addresses and data directories. The coordinator
-and every node holding a required stage must be reachable for inference.
+Restart daemons with the same data directories. Only the requesting peer and
+workers holding required stages need to be online for inference.
 The reference backend recomputes the prefix and exchanges JSON activations;
 it favors a small, inspectable implementation over throughput.
 
@@ -115,9 +150,9 @@ curl -fL "$repo/tok512.bin" -o /tmp/tok512.bin
 uv run python tests/two_nodes.py /tmp/stories260K.bin /tmp/tok512.bin
 ```
 
-The check starts independent loopback daemons, pairs them, imports from the
-second node, verifies disjoint decoder weights, restarts both workers, and
-compares completions from both nodes against an unpartitioned run.
+The check starts independent loopback daemons, verifies disjoint decoder weights,
+tests recovery from a missing owner, failed staging, offline importer, stale
+weight cleanup, and endpoint changes, and compares against an unpartitioned run.
 
 To test the GGUF backend with no external model download, run
 `uv run python tests/gguf_nodes.py`. The development environment includes

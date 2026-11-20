@@ -34,7 +34,21 @@ from .common import (
 from .qwen import gg_stage, import_gg
 from .bpe import load_tokenizer
 
-LOCK = threading.RLock()
+from .mesh import (
+    LOCK,
+    initialize,
+    enroll,
+    join,
+    merge,
+    gossip,
+    online,
+    publish,
+    commit,
+    snapshot,
+    unavailable,
+)
+from .placement import file_rpc, location, redistribute, verify
+
 ACTIVE: dict[str, int] = {}
 
 
@@ -105,7 +119,9 @@ def layout(c: Sequence[int]) -> Iterator[tuple[str, tuple[int, ...], int | None]
         yield "out", (-vocab, d), n
 
 
-def import_model(name: str, source: str, tokenizer: str) -> Model:
+def import_model(
+    name: str, source: str, tokenizer: str, *, exclude_self: bool = False
+) -> Model:
     ident(name)
     s = state()
     cat = catalog(s)
@@ -120,13 +136,19 @@ def import_model(name: str, source: str, tokenizer: str) -> Model:
             and heads % kv == 0,
             "not a supported llama2.c checkpoint",
         )
-        nodes = cat["nodes"][:n]
+        nodes = online(exclude_self)[:n]
         owners = [nodes[i * len(nodes) // n] for i in range(n)]
 
         def owner(i: int) -> str:
             return owners[min(n - 1, max(0, i))]
 
-        m = Model(id=uid, config=list(c), owners=owners)
+        m = Model(
+            id=uid,
+            config=list(c),
+            owners=owners,
+            source=location(source),
+            tokenizer_source=location(tokenizer),
+        )
         needed = dict.fromkeys(nodes, 0)
         for key, shape, i in layout(c):
             if i is None:
@@ -163,12 +185,13 @@ def import_model(name: str, source: str, tokenizer: str) -> Model:
                 if key == "emb" and vocab > 0 and owner(0) != owner(n):
                     upload(owner(n), "emb", raw)
             check(not f.read(1), "unexpected trailing checkpoint data")
-            rpc(s["leader"], "publish", dict(name=name, model=m))
+            verify(m, nodes, {})
         except Exception:
             for node in nodes:
                 with contextlib.suppress(Exception):
                     rpc(node, "discard", {"id": uid})
             raise
+    publish(name, m)
     return m
 
 
@@ -285,6 +308,13 @@ def stage(m: Model, start: int, end: int, payload: Payload) -> int | list[list[f
 def generate(m: Model, prompt: str, count: int) -> str:
     import itertools
 
+    m = m.copy()
+    m.pop("files", None)
+    missing = unavailable(m)
+    check(
+        not missing,
+        f"unavailable layers by owner: {missing}; bring the peer back or use model redistribute",
+    )
     owners = m["owners"]
     ctx = m["qwen"]["ctx"] if m.get("backend") == "qwen3moe" else m["config"][-1]
     check(0 < count <= ctx, "invalid token count")
@@ -369,48 +399,29 @@ class Handler(BaseHTTPRequestHandler):
                     f"GGUF runtime unavailable; reinstall Armada with uv: {e}"
                 ) from e
             return True
-        if op == "catalog":
-            return dict(fleet=s["fleet"], nodes=s["nodes"], models=s["models"])
-        if op in ("init", "enroll", "join", "publish", "pair"):
+        if op == "ping":
+            return s["uid"]
+        if op == "sync":
+            merge(b)
+            return snapshot(state())
+        if op == "commit":
+            commit(b)
+            return True
+        if op == "enroll":
+            return enroll(b, self.headers["Authorization"])
+        if op == "join":
+            join(b["node"], b["code"], b.get("return_address"))
+            return True
+        if op in ("inventory", "read-chunk", "link"):
+            return file_rpc(op, b)
+        if op in ("pair", "init"):
             with LOCK:
                 s = state()
-                if op == "init":
-                    check("leader" not in s, "already enrolled")
-                    s.update(
-                        {
-                            "fleet": ident(b["name"]),
-                            "leader": s["addr"],
-                            "nodes": [s["addr"]],
-                            "models": {},
-                        }
-                    )
-                    s.pop("pair", None)
-                elif op == "pair":
-                    check("leader" not in s, "already enrolled")
+                if op == "pair":
+                    check(len(s["peers"]) == 1, "node already paired")
                     s["pair"] = secrets.token_urlsafe(24)
-                elif op == "enroll":
-                    check(
-                        "leader" not in s
-                        and self.headers["Authorization"] == "Bearer " + s["pair"],
-                        "invalid pairing",
-                    )
-                    s.update({"leader": address(b["leader"]), "key": b["key"]})
-                    del s["pair"]
-                elif op == "join":
-                    check(s.get("leader") == s["addr"], "not coordinator")
-                    node = address(b["node"])
-                    check(node not in s["nodes"], "already enrolled")
-                    rpc(
-                        node,
-                        "enroll",
-                        dict(leader=s["addr"], key=s["key"]),
-                        key=b["code"],
-                    )
-                    s["nodes"].append(node)
                 else:
-                    name = ident(b["name"])
-                    check(name not in s["models"], "model already exists")
-                    s["models"][name] = b["model"]
+                    s["fleet"] = ident(b["name"])
                 save(home() / "node.json", s)
                 return s["pair"] if op == "pair" else True
         if op == "discard":
@@ -493,29 +504,25 @@ def execute(args: list[str]) -> object:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as e:
-                raise ValueError("a daemon is already running in this ARMADA_HOME") from e
+                raise ValueError(
+                    "a daemon is already running in this ARMADA_HOME"
+                ) from e
             path = home() / "node.json"
-            node: NodeState = state() if path.exists() else {
-                "addr": bind_addr, "key": secrets.token_urlsafe(32)
-            }
-            old = node["addr"]
-            old_host = old.split(":")[0]
-            # Only an enrolled address is referenced by another machine.
-            peer_host = host
-            if host == "0.0.0.0":
-                peer_host = old_host if "leader" in node else advertised_host()
-            addr = address(f"{peer_host}:{port}")
-            if addr != old and "leader" in node:
-                check(node["leader"] == old and node.get("nodes") == [old],
-                      f"fleet peers reference {old}; restart with its original address and port")
-                node["leader"] = addr
-                node["nodes"] = [addr]
-                for model in node["models"].values():
-                    model["owners"] = [addr if owner == old else owner for owner in model["owners"]]
-            node["addr"] = addr
+            node: NodeState = (
+                state()
+                if path.exists()
+                else {"addr": bind_addr, "key": secrets.token_urlsafe(32)}
+            )
+            addr = address(f"{advertised_host() if host=='0.0.0.0' else host}:{port}")
+            advertise = address(f"{a[2]}:{port}") if len(a) > 2 else None
+            initialize(node, addr, advertise)
             with ThreadingHTTPServer((host, port), Handler) as server:
                 save(path, node)
-                print(f"Armada listening on {bind_addr}; fleet address {addr}", flush=True)
+                threading.Thread(target=gossip, daemon=True).start()
+                print(
+                    f"Armada listening on {bind_addr}; peer address {node['peers'][node['uid']]['endpoint']}",
+                    flush=True,
+                )
                 server.serve_forever()
     s = state()
     if op in ("init", "pair"):
@@ -526,11 +533,21 @@ def execute(args: list[str]) -> object:
             if sys.stdin.isatty()
             else sys.stdin.readline()
         )
-        return rpc(s["leader"], "join", dict(node=a[0], code=code.strip()))
+        return rpc(
+            s["addr"],
+            "join",
+            dict(
+                node=a[0],
+                code=code.strip(),
+                return_address=a[1] if len(a) > 1 else None,
+            ),
+        )
+    if op == "redistribute":
+        return redistribute(*a)
     if op == "import":
-        return import_model(*a)
+        return import_model(*a[:3], exclude_self=len(a) > 3)
     if op == "import-gguf":
-        return import_gg(*a)
+        return import_gg(*a[:2], exclude_self=len(a) > 2)
     if op == "run":
         return rpc(
             s["addr"],
@@ -539,10 +556,14 @@ def execute(args: list[str]) -> object:
         )["choices"][0]["text"]
     cat = catalog(s)
     if op == "model":
-        return cat["models"][a[0]]
+        model = cat["models"][a[0]].copy()
+        count = len(model.pop("files", {}))
+        return dict(
+            **model, verified_artifacts=count, unavailable_layers=unavailable(model)
+        )
     for peer in cat["nodes"]:
         try:
             cat.setdefault("resources", {})[peer] = rpc(peer, "stats")
         except Exception as e:
             cat["resources"][peer] = {"error": str(e)}
-    return cat
+    return dict(**cat, peers=s["peers"], self=s["uid"])

@@ -55,6 +55,7 @@ def rpc(
     data: object = None,
     body: bytes | None = None,
     key: str | None = None,
+    timeout: float | None = None,
 ) -> object: ...
 def rpc(
     host: str,
@@ -62,16 +63,20 @@ def rpc(
     data: object = None,
     body: bytes | None = None,
     key: str | None = None,
+    timeout: float | None = None,
 ) -> object:
+    s = state()
+    if host in s.get("peers", {}):
+        host = s["addr"] if host == s["uid"] else s["peers"][host]["endpoint"]
     req = Request(
         "http://" + address(host) + "/" + op,
         data=json.dumps(data or {}).encode() if body is None else body,
-        headers={"Authorization": "Bearer " + (state()["key"] if key is None else key)},
+        headers={"Authorization": "Bearer " + (s["key"] if key is None else key)},
     )
     try:
         # Fleet addresses are direct peer connections, including local LAN IPs.
         with build_opener(ProxyHandler({})).open(
-            req, timeout=float(os.environ.get("ARMADA_RPC_TIMEOUT", "300"))
+            req, timeout=timeout or float(os.environ.get("ARMADA_RPC_TIMEOUT", "300"))
         ) as r:
             return json.load(r)
     except HTTPError as e:
@@ -79,8 +84,9 @@ def rpc(
 
 
 def catalog(s: NodeState) -> Catalog:
-    check("leader" in s, "node not enrolled; initialize or join a fleet")
-    return cast(Catalog, rpc(s["leader"], "catalog"))
+    return Catalog(
+        fleet=s.get("fleet", "armada"), nodes=list(s["peers"]), models=s["models"]
+    )
 
 
 def open_source(s: str) -> BinaryIO:

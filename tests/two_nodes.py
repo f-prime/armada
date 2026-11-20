@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from armada.schema import Model
 from contextlib import ExitStack
@@ -56,10 +57,9 @@ def test(
             return stop
 
         stop0, stop1 = start(0), start(1)
-        cmd(0, "fleet", "init", "test")
         cmd(
             0,
-            "fleet",
+            "peer",
             "add",
             addresses[1],
             stdin=cmd(1, "fleet", "pairing-code") + "\n",
@@ -67,11 +67,14 @@ def test(
         add = ("model", "add", checkpoint, "--name", "tiny") + (
             ("--tokenizer", tokenizer) if tokenizer else ()
         )
-        m: Model = json.loads(cmd(1, *add))
-        assert set(m["owners"]) == set(addresses)
+        m: Model = json.loads(cmd(0, *add))
+        ids = [
+            json.loads((root / str(i) / "node.json").read_text())["uid"] for i in (0, 1)
+        ]
+        assert set(m["owners"]) == set(ids)
         for i in (0, 1):
             shard = root / str(i) / "weights" / m["id"]
-            layers = {j for j, a in enumerate(m["owners"]) if a == addresses[i]}
+            layers = {j for j, a in enumerate(m["owners"]) if a == ids[i]}
             if tokenizer:
                 assert {p.name for p in shard.glob("q_*.bin")} == {
                     f"q_{j}.bin" for j in layers
@@ -88,13 +91,73 @@ def test(
         start(2)
         cmd(2, "fleet", "init", "solo")
         cmd(2, *add)
+        args = ("run", "tiny", "Once upon a time", "-n", "16")
+        expected = cmd(2, *args)
+        stop0, stop1 = start(0), start(1)
+        stop3 = start(3)
+        # Third peer drives import but stores no weights.
+        cmd(0, "peer", "add", addresses[3], stdin=cmd(3, "peer", "pairing-code") + "\n")
+        other = list(add)
+        other[other.index("--name") + 1] = "recovery"
+        recovery = json.loads(cmd(3, *other, "--no-local-weights"))
+        assert set(recovery["owners"]) == set(ids)
+        stop3()
+        run_recovery = ("run", "recovery", *args[2:])
+        assert cmd(0, *run_recovery) == expected
+        stop1()
+        # Missing source must not destroy the only remaining good shard.
+        failure = subprocess.run(
+            [
+                cli,
+                "model",
+                "redistribute",
+                "recovery",
+                "--source",
+                str(root / "absent"),
+            ],
+            env=env(0),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert failure.returncode and (root / "0" / "weights" / recovery["id"]).is_dir()
+        assert json.loads(cmd(0, "model", "status", "recovery"))["id"] == recovery["id"]
+        new = json.loads(cmd(0, "model", "redistribute", "recovery"))
+        assert set(new["owners"]) == {ids[0]}
+        assert not (root / "0" / "weights" / recovery["id"]).exists()
+        assert cmd(0, *run_recovery) == expected
+        stop1 = start(1)
+        until = time.monotonic() + 20
+        while (root / "1" / "weights" / recovery["id"]).exists():
+            assert time.monotonic() < until, "returning worker kept obsolete weights"
+            time.sleep(0.1)
+        assert cmd(1, *run_recovery) == expected
         if reference:
-            # Remove the entire import source before restarting either worker.
+            # No GGUF source remains for the next redistribution.
             for path in Path(checkpoint).parent.glob("*.gguf"):
                 path.unlink()
-        start(0)
+        moved = json.loads(
+            cmd(
+                1, "model", "redistribute", "recovery", "--source", str(root / "absent")
+            )
+        )
+        assert set(moved["owners"]) == set(ids)
+        assert cmd(1, *run_recovery) == expected
+        # Rebind a layer owner to another port. Its ID and placement survive.
+        stop1()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            addresses[1] = f"127.0.0.1:{sock.getsockname()[1]}"
         start(1)
-        args = ("run", "tiny", "Once upon a time", "-n", "16")
+        until = time.monotonic() + 20
+        while (
+            json.loads((root / "0" / "node.json").read_text())["peers"][ids[1]][
+                "endpoint"
+            ]
+            != addresses[1]
+        ):
+            assert time.monotonic() < until, "peer retained old endpoint"
+            time.sleep(0.1)
         first = cmd(0, *args)
         assert first and first == cmd(1, *args)
         print("Two-node completion:", first)

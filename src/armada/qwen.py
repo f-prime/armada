@@ -166,7 +166,11 @@ def gg_parts(source: str) -> list[str]:
     ]
 
 
-def import_gg(name: str, source: str) -> Model:
+from .mesh import online, publish
+from .placement import location, verify
+
+
+def import_gg(name: str, source: str, *, exclude_self: bool = False) -> Model:
     ident(name)
     s = state()
     cat = catalog(s)
@@ -186,7 +190,7 @@ def import_gg(name: str, source: str) -> Model:
                 )
                 if part == 0:
                     c = gg_config(meta)
-                    nodes = cat["nodes"][: c["layers"]]
+                    nodes = online(exclude_self)[: c["layers"]]
                     for node in nodes:
                         rpc(node, "qwen-ready")
                     owners = [
@@ -208,7 +212,12 @@ def import_gg(name: str, source: str) -> Model:
                         )
                     ]
                     m = Model(
-                        id=uid, backend="qwen3moe", qwen=c, owners=owners, stop=stops
+                        id=uid,
+                        backend="qwen3moe",
+                        qwen=c,
+                        owners=owners,
+                        stop=stops,
+                        source=location(source),
                     )
                     tok = gg_tokenizer(meta)
                     rpc(
@@ -252,13 +261,14 @@ def import_gg(name: str, source: str) -> Model:
         for node, manifest in manifests.items():
             b = json.dumps(manifest).encode()
             rpc(node, f"weight/{uid}/manifest/{hashlib.sha256(b).hexdigest()}", body=b)
-        rpc(s["leader"], "publish", dict(name=name, model=m))
-        return m
+        verify(m, nodes, {})
     except Exception:
         for node in manifests:
             with contextlib.suppress(Exception):
                 rpc(node, "discard", {"id": uid})
         raise
+    publish(name, m)
+    return m
 
 
 def gg_stage(

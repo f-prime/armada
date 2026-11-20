@@ -34,6 +34,22 @@ class Model(TypedDict):
     backend: NotRequired[str]
     qwen: NotRequired[QwenConfig]
     stop: NotRequired[list[int]]
+    revision: NotRequired[int]
+    retired: NotRequired[list[str]]
+    source: NotRequired[str]
+    tokenizer_source: NotRequired[str]
+    files: NotRequired[dict[str, "Artifact"]]
+
+
+class Artifact(TypedDict):
+    size: int
+    digest: str
+    tensor: NotRequired[tuple[str, list[int], int]]
+
+
+class Peer(TypedDict):
+    endpoint: str
+    version: int
 
 
 class Catalog(TypedDict):
@@ -51,3 +67,5 @@ class NodeState(TypedDict):
     fleet: NotRequired[str]
     nodes: NotRequired[list[str]]
     models: NotRequired[dict[str, Model]]
+    uid: NotRequired[str]
+    peers: NotRequired[dict[str, Peer]]
