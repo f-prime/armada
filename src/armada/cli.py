@@ -18,6 +18,9 @@ def main() -> int:
         "--version", action="version", version=f"armada {version('armada')}"
     )
     groups = parser.add_subparsers(required=True)
+    status_cmd = groups.add_parser("status", help="show the fleet summary")
+    status_cmd.add_argument("--json", action="store_true", help="print the full fleet snapshot")
+    status_cmd.set_defaults(op="status", keys=[])
     daemon = groups.add_parser("daemon", help="run a foreground worker")
     daemon.add_argument(
         "--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)"
@@ -37,6 +40,8 @@ def main() -> int:
         ("status", "status", []),
     ]:
         cmd = fleet.add_parser(name)
+        if op == "status":
+            cmd.add_argument("--json", action="store_true", help="print the full fleet snapshot")
         for key in keys:
             cmd.add_argument(key)
         if op == "add":
@@ -91,6 +96,10 @@ def main() -> int:
 
     try:
         result = execute([args.op, *(str(getattr(args, k)) for k in args.keys)])
+        if args.op == "status" and not args.json and isinstance(result, dict):
+            from .status import format_status
+
+            result = format_status(result)
         print(result if isinstance(result, str) else json.dumps(result, indent=2))
     except (Exception, KeyboardInterrupt) as e:
         print(f"armada: {e}", file=sys.stderr)

@@ -33,6 +33,7 @@ from .common import (
 )
 from .qwen import gg_stage, import_gg
 from .bpe import load_tokenizer
+from .gpu import gpu_stats
 
 from .mesh import (
     LOCK,
@@ -79,27 +80,7 @@ def memory_stats() -> tuple[int | None, int | None]:
 
 def stats() -> Fields:
     free_ram, total_ram = memory_stats()
-    gpu = []
-    if shutil.which("nvidia-smi"):
-        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
-            lines = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=name,memory.free,memory.total",
-                    "--format=csv,noheader,nounits",
-                ],
-                text=True,
-                timeout=3,
-            )
-            for line in lines.splitlines():
-                name, free, total = line.rsplit(",", 2)
-                gpu.append(
-                    dict(
-                        name=name,
-                        free_vram=int(free) * 2**20,
-                        total_vram=int(total) * 2**20,
-                    )
-                )
+    gpus = gpu_stats()
     with LOCK:
         active = list(ACTIVE)
     return dict(
@@ -107,7 +88,9 @@ def stats() -> Fields:
         total_ram=total_ram,
         cpu_threads=os.cpu_count(),
         cpu_load_1m=os.getloadavg()[0],
-        nvidia_gpus=gpu,
+        gpus=gpus,
+        nvidia_gpus=[{k: g[k] for k in ("name", "free_vram", "total_vram") if k in g}
+                     for g in gpus if g.get("vendor") == "NVIDIA"],
         free_disk=shutil.disk_usage(home()).free,
         shards={
             p.name: sum(f.stat().st_size for f in p.glob("*.bin"))
@@ -581,9 +564,10 @@ def execute(args: list[str]) -> object:
         return dict(
             **model, verified_artifacts=count, unavailable_layers=unavailable(model)
         )
+    resources = cat.setdefault("resources", {})
     for peer in cat["nodes"]:
         try:
-            cat.setdefault("resources", {})[peer] = rpc(peer, "stats")
+            resources[peer] = rpc(peer, "stats")
         except Exception as e:
-            cat["resources"][peer] = {"error": str(e)}
+            resources[peer] = {"error": str(e)}
     return dict(**cat, peers=s["peers"], self=s["uid"])

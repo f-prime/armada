@@ -119,8 +119,13 @@ the largest individual matrix and conversion scratch must fit in RAM.
 Placement divides layers by count across enrolled nodes and checks free disk;
 it does not yet optimize for heterogeneous RAM. Input embeddings and the
 output head live on the end stages (tied weights are duplicated if needed).
-`fleet status` reports available RAM, disk, CPU load, NVIDIA GPU memory where
-available, persisted bytes per model ID, and active stage requests.
+`armada status` (also `armada peer status` or `armada fleet status`) shows a
+per-node summary of RAM, disk, CPU load, GPUs, and active models. Linux peers
+discover GPUs through sysfs and enrich NVIDIA data with `nvidia-smi` when
+available. Macs use System Profiler; Apple Silicon reports shared memory rather
+than dedicated VRAM. A dash means the metric was not reported.
+Use `armada status --json` for the full machine-readable snapshot, including
+peer endpoints, model metadata, and persisted shard sizes.
 
 Restart daemons with the same data directories. Only the requesting peer and
 workers holding required stages need to be online for inference.
