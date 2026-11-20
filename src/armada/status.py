@@ -3,7 +3,16 @@
 from .schema import Fields
 
 
-def _size(value: int | None) -> str:
+def format_models(models: list[Fields]) -> str:
+    if not models:
+        return "No models registered in the fleet."
+    width = max(len("MODEL"), max(len(m["name"]) for m in models))
+    rows = [f"{'MODEL':<{width}}  PEERS"]
+    rows.extend(f"{m['name']:<{width}}  {m['peer_count']}" for m in models)
+    return "\n".join(rows)
+
+
+def format_size(value: int | None) -> str:
     if value is None:
         return "—"
     size = float(value)
@@ -28,8 +37,8 @@ def format_status(snapshot: Fields) -> str:
         rows.append((label + (" (you)" if node == snapshot.get("self") else ""),
                      str(stats.get("cpu_threads") or "—"),
                      f"{stats['cpu_load_1m']:.2f}" if stats.get("cpu_load_1m") is not None else "—",
-                     f"{_size(stats.get('free_ram'))} / {_size(stats.get('total_ram'))}",
-                     _size(stats.get("free_disk"))))
+                     f"{format_size(stats.get('free_ram'))} / {format_size(stats.get('total_ram'))}",
+                     format_size(stats.get("free_disk"))))
         if "error" in stats or not stats:
             details.append(f"{label}  Resource check failed: {stats.get('error', 'no report')}")
             continue
@@ -39,7 +48,7 @@ def format_status(snapshot: Fields) -> str:
                            f"{label}  No NVIDIA GPUs reported (older peer)")
         for gpu in gpus:
             memory = ("unified (shared with RAM)" if gpu.get("unified_memory") else
-                      f"{_size(gpu.get('free_vram'))} free / {_size(gpu.get('total_vram'))} total"
+                      f"{format_size(gpu.get('free_vram'))} free / {format_size(gpu.get('total_vram'))} total"
                       if "total_vram" in gpu or "free_vram" in gpu else "memory unknown")
             details.append(f"{label}  GPU: {gpu['name']} · {memory}")
         if stats.get("active_models"):

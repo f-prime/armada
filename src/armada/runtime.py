@@ -1,4 +1,5 @@
 import contextlib
+import codecs
 import fcntl
 import getpass
 import hashlib
@@ -34,6 +35,10 @@ from .common import (
 from .qwen import gg_stage, import_gg
 from .bpe import load_tokenizer
 from .gpu import gpu_stats
+from .progress import Progress, terminal_progress
+from . import chat
+from .keys import authorized
+from .mesh import key_command
 
 from .mesh import (
     LOCK,
@@ -126,7 +131,8 @@ def layout(c: Sequence[int]) -> Iterator[tuple[str, tuple[int, ...], int | None]
 
 
 def import_model(
-    name: str, source: str, tokenizer: str, *, exclude_self: bool = False
+    name: str, source: str, tokenizer: str, *, exclude_self: bool = False,
+    progress: Progress | None = None,
 ) -> Model:
     ident(name)
     s = state()
@@ -170,10 +176,14 @@ def import_model(
         def upload(node: str, key: str, b: bytes) -> None:
             digest = hashlib.sha256(b).hexdigest()
             rpc(node, f"weight/{uid}/{key}/{digest}", body=b)
+            if progress:
+                progress.advance(len(b))
 
         with open_source(tokenizer) as t:
             tok = t.read(16 * 1024 * 1024 + 1)
             parse_tokenizer(tok, abs(vocab))
+        if progress:
+            progress.start(f"Distributing {name} · peers: {len(nodes)}", sum(needed.values()) + len(tok))
         upload(owner(0), "tokenizer", tok)
         try:
             for key, shape, i in layout(c):
@@ -191,13 +201,19 @@ def import_model(
                 if key == "emb" and vocab > 0 and owner(0) != owner(n):
                     upload(owner(n), "emb", raw)
             check(not f.read(1), "unexpected trailing checkpoint data")
+            if progress:
+                progress.phase("Verifying weights…")
             verify(m, nodes, {})
         except Exception:
             for node in nodes:
                 with contextlib.suppress(Exception):
                     rpc(node, "discard", {"id": uid})
             raise
+    if progress:
+        progress.phase("Publishing model…")
     publish(name, m)
+    if progress:
+        progress.phase(f"{name} is ready.")
     return m
 
 
@@ -311,7 +327,7 @@ def stage(m: Model, start: int, end: int, payload: Payload) -> int | list[list[f
     return cast(list[list[float]], x.tolist())
 
 
-def generate(m: Model, prompt: str, count: int) -> str:
+def generation(m: Model, prompt: str, count: int, stats: Fields) -> Iterator[int]:
     import itertools
 
     m = m.copy()
@@ -326,30 +342,139 @@ def generate(m: Model, prompt: str, count: int) -> str:
     check(0 < count <= ctx, "invalid token count")
     tokens = rpc(owners[0], "tokenize", dict(model=m, prompt=prompt))
     check(0 < len(tokens) < ctx, "prompt is empty or exceeds context window")
-    output = []
-    for _ in range(min(count, ctx - len(tokens))):
-        payload: Payload | int = tokens
-        start = 0
-        for node, group in itertools.groupby(owners):
-            end = start + sum(1 for _ in group)
-            payload = rpc(
-                node, "stage", dict(model=m, start=start, end=end, payload=payload)
-            )
-            start = end
-        if not isinstance(payload, int):
-            raise ValueError("final stage did not return a token ID")
-        if payload in m.get("stop", (1, 2)):
-            break
-        tokens.append(payload)
-        output.append(payload)
-    return str(rpc(owners[0], "decode", dict(model=m, tokens=output)))
+    prompt_len = len(tokens)
+
+    def steps() -> Iterator[int]:
+        reason = "length"
+        sampled = 0
+        for _ in range(min(count, ctx - prompt_len)):
+            payload: Payload | int = tokens
+            start = 0
+            for node, group in itertools.groupby(owners):
+                end = start + sum(1 for _ in group)
+                payload = rpc(node, "stage", dict(model=m, start=start, end=end, payload=payload))
+                start = end
+            if not isinstance(payload, int):
+                raise ValueError("final stage did not return a token ID")
+            sampled += 1
+            if payload in m.get("stop", (1, 2)):
+                reason = "stop"
+                break
+            tokens.append(payload)
+            yield payload
+        stats.update(finish_reason=reason, usage=dict(prompt_tokens=prompt_len,
+                     completion_tokens=sampled, total_tokens=prompt_len + sampled))
+    return steps()
+
+
+def generate(m: Model, prompt: str, count: int) -> str:
+    output = list(generation(m, prompt, count, {}))
+    metadata = m.copy()
+    metadata.pop("files", None)
+    return str(rpc(m["owners"][0], "decode", dict(model=metadata, tokens=output)))
+
+
+def chat_pieces(m: Model, tokens: Iterator[int]) -> Iterator[str]:
+    # The tokenizer may live on another machine. Decode raw bytes so a UTF-8
+    # character split across tokens is emitted exactly once.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    for token in tokens:
+        data = rpc(m["owners"][0], "chat-token", dict(id=m["id"], token=token))
+        yield decoder.decode(bytes.fromhex(str(data)))
+    yield decoder.decode(b"", final=True)
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         pass
 
+    def do_GET(self) -> None:
+        self.inference("GET")
+
+    def json_reply(self, status: int, result: object) -> None:
+        payload = json.dumps(result).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def inference(self, method: str) -> None:
+        path = self.path.partition("?")[0]
+        streaming = False
+        try:
+            s = state()
+            auth = self.headers.get("Authorization", "").encode()
+            keys = [os.environ.get("ARMADA_API_KEY", "")]
+            if path == "/v1/completions":
+                keys.append(s["key"])  # Existing Armada CLI and older fleet clients.
+            if not authorized(s, auth) and not any(key and hmac.compare_digest(auth, ("Bearer " + key).encode()) for key in keys):
+                self.json_reply(401, {"error": {"type": "authentication_error", "message": "Invalid API key"}})
+                return
+            models = s["models"]
+            if path == "/v1/models" and method == "GET":
+                self.json_reply(200, dict(object="list", data=[dict(id=name, object="model", created=0,
+                                owned_by="armada") for name in sorted(models)]))
+                return
+            if path not in ("/v1/chat/completions", "/v1/completions") or method != "POST":
+                self.json_reply(404, {"error": {"type": "invalid_request_error", "message": "Unknown endpoint"}})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            check(0 < length <= 16 * 2**20, "expected a JSON body of at most 16 MiB")
+            b = json.loads(readn(self.rfile, length))
+            check(isinstance(b, dict) and isinstance(b.get("model"), str), "expected a model name")
+            if b["model"] not in models:
+                self.json_reply(404, {"error": {"type": "invalid_request_error", "code": "model_not_found",
+                                                "message": "Unknown fleet model: " + b["model"]}})
+                return
+            if path == "/v1/completions":
+                check(not b.get("stream"), "streaming is supported on /v1/chat/completions")
+                check(isinstance(b.get("prompt"), str), "expected a text prompt")
+                self.json_reply(200, self.dispatch("v1/completions", b, s))
+                return
+            model = models[b["model"]]
+            check(model.get("backend") == "qwen3moe", "chat requires a Qwen instruction model; use /v1/completions for base models")
+            check(b.get("n", 1) == 1, "only one completion is supported")
+            check(isinstance(b.get("stream", False), bool), "stream must be a boolean")
+            check(not b.get("stop"), "custom stop sequences are not supported")
+            prompt, names = chat.prompt(b)
+            count = b.get("max_completion_tokens", b.get("max_tokens", min(1024, model["qwen"]["ctx"])))
+            check(type(count) is int and count > 0, "expected a positive token limit")
+            stats: Fields = {}
+            tokens = generation(model, prompt, count, stats)
+            options = b.get("stream_options") or {}
+            check(isinstance(options, dict), "invalid stream_options")
+            chunks = chat.chunks(b["model"], chat_pieces(model, tokens), names, stats,
+                                 not b.get("stream") or options.get("include_usage", False))
+            if not b.get("stream"):
+                self.json_reply(200, chat.collect(chunks))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            streaming = True
+            for chunk in chunks:
+                self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:
+            status = (503 if "unavailable layers" in str(exc) or isinstance(exc, OSError)
+                      else 400 if isinstance(exc, (ValueError, KeyError, TypeError)) else 500)
+            error = {"error": {"type": "invalid_request_error" if status == 400 else "server_error",
+                               "message": str(exc)}}
+            if streaming:
+                with contextlib.suppress(OSError):
+                    self.wfile.write(b"data: " + json.dumps(error).encode() + b"\n\ndata: [DONE]\n\n")
+            else:
+                self.json_reply(status, error)
+
     def do_POST(self) -> None:
+        if self.path.partition("?")[0].startswith("/v1/"):
+            self.inference("POST")
+            return
         try:
             op = self.path.strip("/")
             s = state()
@@ -394,6 +519,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def dispatch(self, op: str, b: Fields, s: NodeState) -> object:
+        if op == "manage-key":
+            return key_command(b)
         if op == "stats":
             return stats()
         if op == "qwen-ready":
@@ -442,6 +569,9 @@ class Handler(BaseHTTPRequestHandler):
                     ACTIVE[uid] -= 1
                     if not ACTIVE[uid]:
                         del ACTIVE[uid]
+        if op == "chat-token":
+            tok = load_tokenizer(home() / "weights" / ident(b["id"]) / "tokenizer.bin")
+            return tok.decode_bytes([b["token"]], keep_special=True).hex()
         if op in ("tokenize", "decode"):
             m = b["model"]
             if m.get("backend") == "qwen3moe":
@@ -530,6 +660,11 @@ def execute(args: list[str]) -> object:
     s = state()
     if op == "pair":
         return rpc(s["addr"], "pair")
+    if op.startswith("key-"):
+        action = op.removeprefix("key-")
+        return rpc(s["addr"], "manage-key", dict(action=action,
+                   id=a[0] if a and action != "create" else "",
+                   name=a[-1] if action in ("create", "rename") else ""))
     if op == "add":
         code = (
             getpass.getpass("Peer pairing code: ")
@@ -547,10 +682,13 @@ def execute(args: list[str]) -> object:
         )
     if op == "redistribute":
         return redistribute(*a)
-    if op == "import":
-        return import_model(*a[:3], exclude_self=len(a) > 3)
-    if op == "import-gguf":
-        return import_gg(*a[:2], exclude_self=len(a) > 2)
+    if op in ("import", "import-gguf"):
+        with terminal_progress() as progress:
+            if progress:
+                progress.phase(f"Preparing {a[0]}…")
+            if op == "import":
+                return import_model(*a[:3], exclude_self=len(a) > 3, progress=progress)
+            return import_gg(*a[:2], exclude_self=len(a) > 2, progress=progress)
     if op == "run":
         return rpc(
             s["addr"],
@@ -558,6 +696,11 @@ def execute(args: list[str]) -> object:
             dict(model=a[0], prompt=a[1], max_tokens=int(a[2])),
         )["choices"][0]["text"]
     cat = catalog(s)
+    if op == "model-list":
+        return [
+            {"name": name, "peer_count": len(set(model["owners"]))}
+            for name, model in sorted(cat["models"].items())
+        ]
     if op == "model":
         model = cat["models"][a[0]].copy()
         count = len(model.pop("files", {}))

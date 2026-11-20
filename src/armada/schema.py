@@ -52,6 +52,14 @@ class Peer(TypedDict):
     version: int
 
 
+class ApiKey(TypedDict):
+    name: str
+    label_version: tuple[int, str]
+    digest: str
+    secret_version: tuple[int, str]
+    revoked: bool
+
+
 class Catalog(TypedDict):
     fleet: str
     nodes: list[str]
@@ -62,6 +70,7 @@ class Catalog(TypedDict):
 class NodeState(TypedDict):
     addr: str
     key: str
+    api_keys: NotRequired[dict[str, ApiKey]]
     pair: NotRequired[str]
     leader: NotRequired[str]
     fleet: NotRequired[str]

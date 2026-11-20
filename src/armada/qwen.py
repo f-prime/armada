@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from .common import catalog, check, home, ident, open_source, readn, rpc, state
 from .schema import Fields, FloatArray, Model, Payload, QwenConfig, Tensor
 from .bpe import gg_tokenizer
+from .progress import Progress
 import math
 
 
@@ -170,7 +171,8 @@ from .mesh import online, publish
 from .placement import location, verify
 
 
-def import_gg(name: str, source: str, *, exclude_self: bool = False) -> Model:
+def import_gg(name: str, source: str, *, exclude_self: bool = False,
+              progress: Progress | None = None) -> Model:
     ident(name)
     s = state()
     cat = catalog(s)
@@ -181,6 +183,8 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False) -> Model:
     manifests: dict[str, dict[str, tuple[str, list[int], int]]] = {}
     try:
         for part, path in enumerate(parts):
+            if progress and len(parts) > 1:
+                progress.phase(f"Preparing part {part + 1}/{len(parts)}…")
             with open_source(path) as f:
                 meta, tensors = gg_header(f)
                 check(
@@ -241,6 +245,11 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False) -> Model:
                         rpc(node, "stats")["free_disk"] >= size,
                         f"{node}: need {size} free disk bytes",
                     )
+                if progress:
+                    label = f"Distributing {name} · peers: {len(nodes)}"
+                    if len(parts) > 1:
+                        label += f" · part {part + 1}/{len(parts)} (part ETA)"
+                    progress.start(label, sum(needs.values()))
                 for offset, name_, shape, qt, size in tensors:
                     check(0 <= offset - pos <= 65536, "invalid GGUF tensor offset")
                     readn(f, offset - pos)
@@ -254,20 +263,30 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False) -> Model:
                             f"chunk/{uid}/{key}/{start}/{hashlib.sha256(b).hexdigest()}",
                             body=b,
                         )
+                        if progress:
+                            progress.advance(len(b))
                     pos = offset + size
         check(
             seen == set(expected), f"missing tensors: {sorted(set(expected)-seen)[:5]}"
         )
+        if progress:
+            progress.phase("Finalizing manifests…")
         for node, manifest in manifests.items():
             b = json.dumps(manifest).encode()
             rpc(node, f"weight/{uid}/manifest/{hashlib.sha256(b).hexdigest()}", body=b)
+        if progress:
+            progress.phase("Verifying weights…")
         verify(m, nodes, {})
     except Exception:
         for node in manifests:
             with contextlib.suppress(Exception):
                 rpc(node, "discard", {"id": uid})
         raise
+    if progress:
+        progress.phase("Publishing model…")
     publish(name, m)
+    if progress:
+        progress.phase(f"{name} is ready.")
     return m
 
 

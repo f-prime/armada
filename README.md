@@ -55,6 +55,16 @@ armada model status stories
 armada run stories 'Once upon a time' -n 32
 ```
 
+In a terminal, `model add` shows acknowledged transfer bytes, speed, and
+estimated transfer time remaining. For split GGUF imports the ETA is per part.
+Verification and publication follow the transfer. Progress goes to stderr;
+stdout still contains the JSON result.
+
+Run `armada model list` for an alphabetical inventory of fleet models and the
+number of distinct peers assigned layers for each. Use `armada model list --json`
+for scripts. The inventory includes models with offline peers; use
+`armada model status NAME` to check layer availability.
+
 Pass `--no-local-weights` to `model add` to keep the importing machine out of
 the placement. Once the manifest is shared, it can go offline.
 
@@ -132,17 +142,70 @@ workers holding required stages need to be online for inference.
 The reference backend recomputes the prefix and exchanges JSON activations;
 it favors a small, inspectable implementation over throughput.
 
-## HTTP completion
+## OpenAI-compatible inference API and OpenCode
 
-On an enrolled node with `jq` installed:
+Create an inference key on any enrolled node. The token is shown only on
+creation or rotation. For example, to set it in your client shell:
 
 ```sh
-node="${ARMADA_HOME:-$HOME/.armada}/node.json"
-curl "http://$(jq -r .addr "$node")/v1/completions" \
-  -H "Authorization: Bearer $(jq -r .key "$node")" \
+armada key create --name opencode --json  # copy the token into ARMADA_API_KEY on the client
+armada key list
+armada key show KEY_ID
+armada key rename KEY_ID editor
+armada key rotate KEY_ID  # update clients with the replacement token
+armada key revoke KEY_ID
+```
+
+All key commands accept `--json`. Managed keys work on every updated daemon
+without setting a daemon environment variable. Only token hashes and metadata
+are replicated. Mutations report acknowledged and pending nodes; an offline
+node can accept an old credential until it syncs. Newly enrolled nodes receive
+the registry, and revocations persist across restarts and stale peer updates.
+Keys grant inference access only. An explicitly configured daemon-side
+`ARMADA_API_KEY` remains a separate local credential unaffected by these commands.
+
+```sh
+base=http://127.0.0.1:7318/v1  # use your daemon's actual address
+curl "$base/models" -H "Authorization: Bearer $ARMADA_API_KEY"
+curl "$base/completions" -H "Authorization: Bearer $ARMADA_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"stories","prompt":"Once upon a time","max_tokens":16}'
+curl -N "$base/chat/completions" -H "Authorization: Bearer $ARMADA_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"coder","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
 ```
+
+`GET /v1/models` lists fleet catalog names, including models whose owners are
+offline. Chat requires a Qwen ChatML instruction model, such as a supported
+Qwen3-Coder GGUF. The chat endpoint supports text messages, streaming and
+non-streaming responses, token limits, usage, and automatic function calls
+with tool-result history. Generation is greedy; custom sampling is not
+implemented. TinyStories is a plain completion model.
+
+For OpenCode V2, add this custom provider to `opencode.jsonc`. Set the base
+URL as seen from the OpenCode service, and use your registered model name:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "armada": {
+      "name": "Armada Fleet",
+      "env": ["ARMADA_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:7318/v1" },
+      "models": { "coder": { "name": "Fleet Coder", "capabilities": {
+        "tools": true, "input": ["text"], "output": ["text"]
+      } } }
+    }
+  }
+}
+```
+
+Set the model's `limit.context` to its `qwen.ctx` value from `armada model status coder`
+and choose a `limit.output` within that window. Make the inference key available to OpenCode and select `armada/coder` in
+`/models`. The client executes requested functions and sends their results
+back to the daemon.
 
 ## Reproduce the integration check
 

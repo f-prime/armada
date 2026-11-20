@@ -141,17 +141,20 @@ class Tokenizer:
                 ids.extend(self.vocab[t] for t in tokens if t in self.vocab)
         return ids
 
-    def decode(self, ids: list[int]) -> str:
+    def decode_bytes(self, ids: list[int], *, keep_special: bool = False) -> bytes:
         buf = bytearray()
         for i in ids:
             word = self.words[i]
-            if word not in self.special:
+            if keep_special or word not in self.special:
                 buf.extend(
                     bytes(UNBYTE[c] for c in word)
                     if all(c in UNBYTE for c in word)
                     else word.encode()
                 )
-        return buf.decode(errors="replace")
+        return bytes(buf)
+
+    def decode(self, ids: list[int]) -> str:
+        return self.decode_bytes(ids).decode(errors="replace")
 
 
 @lru_cache(maxsize=2)

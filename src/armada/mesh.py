@@ -9,6 +9,7 @@ from typing import cast
 
 from .common import address, check, home, ident, rpc, save, state
 from .schema import Fields, Model, NodeState, Peer
+from .keys import merge_keys, metadata, mutate
 
 LOCK = threading.RLock()
 
@@ -49,13 +50,13 @@ def initialize(s: NodeState, local: str, advertised: str | None) -> None:
 
 
 def snapshot(s: NodeState) -> Fields:
-    return dict(peers=s["peers"], models=s["models"])
+    return dict(peers=s["peers"], models=s["models"], api_keys=s.get("api_keys", {}))
 
 
 def merge(data: Fields) -> None:
     with LOCK:
         s = state()
-        changed = False
+        changed = merge_keys(s, data.get("api_keys", {}))
         for uid, record in data["peers"].items():
             ident(uid)
             if uid != s["uid"] and (
@@ -84,12 +85,41 @@ def merge(data: Fields) -> None:
                     shutil.rmtree(home() / "weights" / ident(uid), ignore_errors=True)
 
 
-def sync() -> None:
-    for peer in list(state()["peers"]):
-        if peer != state()["uid"]:
+def sync(key_id: str = "", local: NodeState | None = None) -> list[str]:
+    if local is None:
+        local = state()
+    confirmed = [local["uid"]]
+    for peer in local["peers"]:
+        if peer != local["uid"]:
             with contextlib.suppress(OSError, ValueError):
-                data = cast(Fields, rpc(peer, "sync", snapshot(state()), timeout=3))
+                data = cast(Fields, rpc(peer, "sync", snapshot(local), timeout=3))
                 merge(data)
+                if key_id and key_id in data.get("api_keys", {}):
+                    record = data["api_keys"][key_id]
+                    expected = local["api_keys"][key_id]
+                    if (record["name"], record["digest"], record["revoked"]) != (
+                        expected["name"], expected["digest"], expected["revoked"]
+                    ):
+                        continue
+                    confirmed.append(peer)
+    return confirmed
+
+
+def key_command(b: Fields) -> object:
+    with LOCK:
+        s = state()
+        action, kid = b["action"], b.get("id", "")
+        registry = s.get("api_keys", {})
+        if action == "list":
+            return sorted((metadata(k, r) for k, r in registry.items()), key=lambda r: (r["name"], r["id"]))
+        if action == "show":
+            check(kid in registry, "unknown key ID")
+            return metadata(kid, registry[kid])
+        result = mutate(s, action, kid, b.get("name", ""))
+        save(home() / "node.json", s)
+    confirmed = sync(result["id"], s)
+    result.update(acknowledged=confirmed, pending=sorted(set(s["peers"]) - set(confirmed)))
+    return result
 
 
 def gossip() -> None:
@@ -156,6 +186,7 @@ def enroll(b: Fields, auth: str) -> Fields:
         del s["pair"]
         s["peers"].update(b["peers"])
         s["models"].update(b["models"])
+        merge_keys(s, b.get("api_keys", {}))
         save(home() / "node.json", s)
         return snapshot(s)
 

@@ -18,6 +18,21 @@ def main() -> int:
         "--version", action="version", version=f"armada {version('armada')}"
     )
     groups = parser.add_subparsers(required=True)
+    key_commands = groups.add_parser("key", help="manage fleet inference keys").add_subparsers(required=True)
+    for action in ("create", "list", "show", "rename", "rotate", "revoke"):
+        sub = key_commands.add_parser(action)
+        fields = []
+        if action not in ("create", "list"):
+            sub.add_argument("id")
+            fields.append("id")
+        if action in ("create", "rename"):
+            if action == "create":
+                sub.add_argument("--name", required=True)
+            else:
+                sub.add_argument("name")
+            fields.append("name")
+        sub.add_argument("--json", action="store_true", help="print JSON")
+        sub.set_defaults(op="key-" + action, keys=fields)
     status_cmd = groups.add_parser("status", help="show the fleet summary")
     status_cmd.add_argument("--json", action="store_true", help="print the full fleet snapshot")
     status_cmd.set_defaults(op="status", keys=[])
@@ -51,6 +66,9 @@ def main() -> int:
             )
         cmd.set_defaults(op=op, keys=keys)
     model = groups.add_parser("model").add_subparsers(required=True)
+    inventory = model.add_parser("list", help="list models registered in the fleet")
+    inventory.add_argument("--json", action="store_true", help="print the inventory as JSON")
+    inventory.set_defaults(op="model-list", keys=[])
     add = model.add_parser("add")
     add.add_argument("source")
     add.add_argument("--name", required=True)
@@ -100,6 +118,24 @@ def main() -> int:
             from .status import format_status
 
             result = format_status(result)
+        elif args.op == "model-list" and not args.json and isinstance(result, list):
+            from .status import format_models
+
+            result = format_models(result)
+        elif args.op.startswith("key-") and not args.json:
+            if isinstance(result, list):
+                result = "\n".join(["ID                        STATUS   NAME",
+                                    *(f"{r['id']}  {r['status']:<7}  {r['name']}" for r in result)]
+                                   ) if result else "No fleet API keys."
+            elif isinstance(result, dict):
+                lines = [f"{result['id']}  {result['status']}  {result['name']}"]
+                if "acknowledged" in result:
+                    lines.append("Acknowledged: " + ", ".join(result["acknowledged"]))
+                    if result["pending"]:
+                        lines.append("Pending sync: " + ", ".join(result["pending"]))
+                if "token" in result:
+                    lines.append("Token (shown once): " + result["token"])
+                result = "\n".join(lines)
         print(result if isinstance(result, str) else json.dumps(result, indent=2))
     except (Exception, KeyboardInterrupt) as e:
         print(f"armada: {e}", file=sys.stderr)
