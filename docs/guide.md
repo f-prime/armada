@@ -90,14 +90,14 @@ user lingering stays enabled because other services may depend on it.
 **2. Pair once.** On machine B:
 
 ```sh
-armada peer pairing-code
+armada fleet pairing-code
 ```
 
 On machine A, replace `MACHINE_B_PRIVATE_IP` with B's address, enter the code
 when prompted, and check that `armada status` lists **2 nodes**:
 
 ```sh
-armada peer add MACHINE_B_PRIVATE_IP:5242
+armada fleet add MACHINE_B_PRIVATE_IP:5242
 armada status
 ```
 
@@ -118,7 +118,7 @@ bytes on both peers. `run` should print a story continuation such as
 
 Keep `~/.armada/node.json` private. Override the data directory with `ARMADA_HOME`
 or `--home`. Use `daemon --advertise-host` to announce a DNS name or
-`peer add --return-address HOST:PORT` to specify how B reaches A. Node IDs
+`fleet add --return-address HOST:PORT` to specify how B reaches A. Node IDs
 persist across address changes. Upgrade the whole fleet together, restart each
 daemon with its existing home, and let the peers sync.
 
@@ -207,7 +207,7 @@ the largest individual matrix and conversion scratch must fit in RAM.
 Placement divides layers by count across enrolled nodes and checks free disk;
 it does not yet optimize for heterogeneous RAM. Input embeddings and the
 output head live on the end stages (tied weights are duplicated if needed).
-`armada status` (also `armada peer status` or `armada fleet status`) shows a
+`armada status` (also `armada fleet status`) shows a
 per-node summary of RAM, disk, CPU load, GPUs, and active models. Linux peers
 discover GPUs through sysfs and enrich NVIDIA data with `nvidia-smi` when
 available. Macs use System Profiler; Apple Silicon reports shared memory rather

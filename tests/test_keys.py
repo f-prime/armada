@@ -73,7 +73,7 @@ class FleetKeysTest(unittest.TestCase):
         p, second = start(1)
         r = key(0, "create", "--name", "client")
         kid, old = r["id"], r["token"]
-        command(0, "peer", "add", f"127.0.0.1:{second}", stdin=command(1, "peer", "pairing-code") + "\n")
+        command(0, "fleet", "add", f"127.0.0.1:{second}", stdin=command(1, "fleet", "pairing-code") + "\n")
         self.assertEqual(status(second, old), 200)
         self.assertEqual(status(first, old, admin=True), 403)
         self.assertEqual(key(1, "rename", kid, "editor")["pending"], [])

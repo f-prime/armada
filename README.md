@@ -29,13 +29,13 @@ and status and to stop or restart it. Quit the panel to leave it running.
 machine B, run:
 
 ```sh
-armada peer pairing-code
+armada fleet pairing-code
 ```
 
 On machine A, substitute B’s private IP and enter the code when prompted:
 
 ```sh
-armada peer add MACHINE_B_PRIVATE_IP:5242
+armada fleet add MACHINE_B_PRIVATE_IP:5242
 armada status
 ```
 

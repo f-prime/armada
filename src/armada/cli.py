@@ -53,7 +53,7 @@ def main() -> int:
     worker.set_defaults(op="daemon", keys=["host", "port"])
     groups.add_parser("startup", parents=[daemon], help="start a worker now and at boot").set_defaults(op="startup")
     groups.add_parser("unstartup", help="stop and remove the boot service").set_defaults(op="unstartup")
-    fleet = groups.add_parser("peer", aliases=["fleet"]).add_subparsers(required=True)
+    fleet = groups.add_parser("fleet").add_subparsers(required=True)
     for name, op, keys in [
         ("add", "add", ["address"]),
         ("pairing-code", "pair", []),

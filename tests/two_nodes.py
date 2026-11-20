@@ -59,7 +59,7 @@ def test(
         stop0, stop1 = start(0), start(1)
         cmd(
             0,
-            "peer",
+            "fleet",
             "add",
             addresses[1],
             stdin=cmd(1, "fleet", "pairing-code") + "\n",
@@ -95,7 +95,7 @@ def test(
         stop0, stop1 = start(0), start(1)
         stop3 = start(3)
         # Third peer drives import but stores no weights.
-        cmd(0, "peer", "add", addresses[3], stdin=cmd(3, "peer", "pairing-code") + "\n")
+        cmd(0, "fleet", "add", addresses[3], stdin=cmd(3, "fleet", "pairing-code") + "\n")
         other = list(add)
         other[other.index("--name") + 1] = "recovery"
         recovery = json.loads(cmd(3, *other, "--no-local-weights"))

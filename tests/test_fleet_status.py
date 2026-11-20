@@ -47,7 +47,7 @@ class FleetStatusTest(unittest.TestCase):
                                 self="mac", resources={
                                     "mac": {"gpus": [{"name": "Apple M4", "unified_memory": True}]},
                                     "old": {"nvidia_gpus": []}, "failed": {"error": "timeout"}})
-        for args in (["status"], ["peer", "status"], ["fleet", "status", "--json"]):
+        for args in (["status"], ["fleet", "status"], ["fleet", "status", "--json"]):
             out = io.StringIO()
             with patch.object(sys, "argv", ["armada", *args]), redirect_stdout(out), patch(
                 "armada.runtime.execute", return_value=snapshot
