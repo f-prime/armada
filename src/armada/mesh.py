@@ -50,10 +50,53 @@ def initialize(s: NodeState, local: str, advertised: str | None) -> None:
 
 
 def snapshot(s: NodeState) -> Fields:
-    return dict(peers=s["peers"], models=s["models"], api_keys=s.get("api_keys", {}))
+    return dict(peers=s["peers"], models=s["models"], api_keys=s.get("api_keys", {}),
+                deleted_models=s.get("deleted_models", []))
 
 
-def merge(data: Fields) -> None:
+def merge_models(s: NodeState, data: Fields) -> bool:
+    old = set(s.get("deleted_models", []))
+    deleted = old.union(ident(i) for i in data.get("deleted_models", []))
+    candidates = [*s["models"].values(), *data["models"].values()]
+    # Redistributed generations retain their ancestry. Delete concurrent
+    # descendants too, but never an independent import with the same name.
+    for m in candidates:
+        lineage = {ident(m["id"]), *(ident(i) for i in m.get("retired", []))}
+        if lineage & deleted:
+            deleted.update(lineage)
+    changed = deleted != old
+    if changed:
+        s["deleted_models"] = sorted(deleted)
+    for name, existing in list(s["models"].items()):
+        if existing["id"] in deleted:
+            del s["models"][name]
+            changed = True
+    for name, m in data["models"].items():
+        ident(name)
+        if m["id"] in deleted:
+            continue
+        current = s["models"].get(name)
+        if current is None or (m.get("revision", 0), m["id"]) > (
+            current.get("revision", 0), current["id"],
+        ):
+            s["models"][name] = m
+            changed = True
+    return changed
+
+
+def clean_deleted(s: NodeState) -> list[str]:
+    pending = []
+    for uid in s.get("deleted_models", []):
+        try:
+            shutil.rmtree(home() / "weights" / ident(uid))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pending.append(uid)
+    return pending
+
+
+def merge(data: Fields) -> list[str]:
     with LOCK:
         s = state()
         changed = merge_keys(s, data.get("api_keys", {}))
@@ -66,15 +109,7 @@ def merge(data: Fields) -> None:
                     endpoint=address(record["endpoint"]), version=int(record["version"])
                 )
                 changed = True
-        for name, m in data["models"].items():
-            ident(name)
-            current = s["models"].get(name)
-            if current is None or (m.get("revision", 0), m["id"]) > (
-                current.get("revision", 0),
-                current["id"],
-            ):
-                s["models"][name] = m
-                changed = True
+        changed |= merge_models(s, data)
         if changed:
             save(home() / "node.json", s)
         # Only explicitly superseded generations are garbage. Never sweep staged uploads.
@@ -83,17 +118,23 @@ def merge(data: Fields) -> None:
             for uid in m.get("retired", []):
                 if uid not in live:
                     shutil.rmtree(home() / "weights" / ident(uid), ignore_errors=True)
+        return clean_deleted(s)
 
 
-def sync(key_id: str = "", local: NodeState | None = None) -> list[str]:
+def sync(key_id: str = "", local: NodeState | None = None, deleted: set[str] | None = None) -> list[str]:
     if local is None:
         local = state()
-    confirmed = [local["uid"]]
+    with LOCK:
+        pending = clean_deleted(local)
+    confirmed = [] if deleted and deleted.intersection(pending) else [local["uid"]]
     for peer in local["peers"]:
         if peer != local["uid"]:
             with contextlib.suppress(OSError, ValueError):
                 data = cast(Fields, rpc(peer, "sync", snapshot(local), timeout=3))
                 merge(data)
+                if (deleted and deleted.issubset(data.get("deleted_models", []))
+                    and "cleanup_pending" in data and not deleted.intersection(data["cleanup_pending"])):
+                    confirmed.append(peer)
                 if key_id and key_id in data.get("api_keys", {}):
                     record = data["api_keys"][key_id]
                     expected = local["api_keys"][key_id]
@@ -103,6 +144,19 @@ def sync(key_id: str = "", local: NodeState | None = None) -> list[str]:
                         continue
                     confirmed.append(peer)
     return confirmed
+
+
+def delete_model(name: str, expected: str) -> Fields:
+    with LOCK:
+        s = state()
+        m = s["models"].get(ident(name))
+        check(m is not None and m["id"] == expected, "model placement changed")
+        assert m is not None
+        deleted = {m["id"], *m.get("retired", [])}
+        merge_models(s, dict(models={}, deleted_models=list(deleted)))
+        save(home() / "node.json", s)
+    confirmed = sync(local=s, deleted=deleted)
+    return dict(name=name, id=expected, confirmed=confirmed, pending=sorted(set(s["peers"]) - set(confirmed)))
 
 
 def key_command(b: Fields) -> object:
@@ -185,7 +239,7 @@ def enroll(b: Fields, auth: str) -> Fields:
         s["key"] = b["key"]
         del s["pair"]
         s["peers"].update(b["peers"])
-        s["models"].update(b["models"])
+        merge_models(s, b)
         merge_keys(s, b.get("api_keys", {}))
         save(home() / "node.json", s)
         return snapshot(s)

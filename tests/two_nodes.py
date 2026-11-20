@@ -120,7 +120,7 @@ def test(
             timeout=30,
         )
         assert failure.returncode and (root / "0" / "weights" / recovery["id"]).is_dir()
-        assert json.loads(cmd(0, "model", "status", "recovery"))["id"] == recovery["id"]
+        assert json.loads(cmd(0, "model", "status", "recovery", "--json"))["id"] == recovery["id"]
         new = json.loads(cmd(0, "model", "redistribute", "recovery"))
         assert set(new["owners"]) == {ids[0]}
         assert not (root / "0" / "weights" / recovery["id"]).exists()
@@ -147,7 +147,7 @@ def test(
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             addresses[1] = f"127.0.0.1:{sock.getsockname()[1]}"
-        start(1)
+        stop1 = start(1)
         until = time.monotonic() + 20
         while (
             json.loads((root / "0" / "node.json").read_text())["peers"][ids[1]][
@@ -164,6 +164,22 @@ def test(
         assert first == cmd(2, *args)
         if reference:
             assert first == reference.strip(), (first, reference)
+        if tokenizer:
+            stop1()
+            removed = json.loads(cmd(0, "model", "delete", "tiny", "--json"))
+            assert ids[0] in removed["confirmed"] and ids[1] in removed["pending"]
+            assert not (root / "0" / "weights" / m["id"]).exists()
+            assert (root / "1" / "weights" / m["id"]).is_dir()
+            assert "tiny" not in [r["name"] for r in json.loads(cmd(0, "model", "list", "--json"))]
+            replacement = json.loads(cmd(0, *add))
+            assert replacement["id"] != m["id"]
+            start(1)
+            until = time.monotonic() + 20
+            while (root / "1" / "weights" / m["id"]).exists():
+                assert time.monotonic() < until, "returning peer retained deleted weights"
+                time.sleep(0.1)
+            assert json.loads(cmd(1, "model", "status", "tiny", "--json"))["id"] == replacement["id"]
+            assert cmd(1, *args) == first
 
 
 if __name__ == "__main__":

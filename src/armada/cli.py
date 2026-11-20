@@ -69,6 +69,10 @@ def main() -> int:
     inventory = model.add_parser("list", help="list models registered in the fleet")
     inventory.add_argument("--json", action="store_true", help="print the inventory as JSON")
     inventory.set_defaults(op="model-list", keys=[])
+    delete = model.add_parser("delete", help="delete a model and its shards across the fleet")
+    delete.add_argument("name")
+    delete.add_argument("--json", action="store_true", help="print the cleanup report as JSON")
+    delete.set_defaults(op="model-delete", keys=["name"])
     add = model.add_parser("add")
     add.add_argument("source")
     add.add_argument("--name", required=True)
@@ -81,6 +85,7 @@ def main() -> int:
     add.set_defaults(op="import-gguf", keys=["name", "source"])
     status = model.add_parser("status")
     status.add_argument("name")
+    status.add_argument("--json", action="store_true", help="print the full model status")
     status.set_defaults(op="model", keys=["name"])
     red = model.add_parser(
         "redistribute", help="rebuild placement across reachable peers"
@@ -118,10 +123,20 @@ def main() -> int:
             from .status import format_status
 
             result = format_status(result)
+        elif args.op == "model" and not args.json and isinstance(result, dict):
+            from .status import format_model_status
+
+            result = format_model_status(args.name, result)
         elif args.op == "model-list" and not args.json and isinstance(result, list):
             from .status import format_models
 
             result = format_models(result)
+        elif args.op == "model-delete" and not args.json and isinstance(result, dict):
+            lines = [f"Deleted model: {result['name']}",
+                     "Cleanup confirmed: " + (", ".join(result["confirmed"]) or "none")]
+            if result["pending"]:
+                lines.append("Cleanup pending: " + ", ".join(result["pending"]))
+            result = "\n".join(lines)
         elif args.op.startswith("key-") and not args.json:
             if isinstance(result, list):
                 result = "\n".join(["ID                        STATUS   NAME",

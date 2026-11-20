@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterator, Sequence
 from typing import cast
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,7 +39,7 @@ from .gpu import gpu_stats
 from .progress import Progress, terminal_progress
 from . import chat
 from .keys import authorized
-from .mesh import key_command
+from .mesh import delete_model, key_command
 
 from .mesh import (
     LOCK,
@@ -535,8 +536,11 @@ class Handler(BaseHTTPRequestHandler):
         if op == "ping":
             return s["uid"]
         if op == "sync":
-            merge(b)
-            return snapshot(state())
+            with LOCK:
+                pending = merge(b)
+                return dict(**snapshot(state()), cleanup_pending=pending)
+        if op == "model-delete":
+            return delete_model(b["name"], b["id"])
         if op == "commit":
             commit(b)
             return True
@@ -696,6 +700,9 @@ def execute(args: list[str]) -> object:
             dict(model=a[0], prompt=a[1], max_tokens=int(a[2])),
         )["choices"][0]["text"]
     cat = catalog(s)
+    if op == "model-delete":
+        check(a[0] in cat["models"], f"unknown model: {a[0]}")
+        return rpc(s["addr"], op, dict(name=a[0], id=cat["models"][a[0]]["id"]))
     if op == "model-list":
         return [
             {"name": name, "peer_count": len(set(model["owners"]))}
@@ -704,8 +711,25 @@ def execute(args: list[str]) -> object:
     if op == "model":
         model = cat["models"][a[0]].copy()
         count = len(model.pop("files", {}))
+        missing = unavailable(model)
+        peers = list(dict.fromkeys([*model["owners"], *cat["nodes"]]))
+
+        def stored(peer: str) -> int | None:
+            if peer not in missing:
+                try:
+                    report = rpc(peer, "stats", timeout=12)
+                    if isinstance(report, dict) and isinstance(report.get("shards"), dict):
+                        size = report["shards"].get(model["id"], 0)
+                        if type(size) is int and size >= 0:
+                            return size
+                except (OSError, ValueError):
+                    pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            storage = dict(zip(peers, pool.map(stored, peers)))
         return dict(
-            **model, verified_artifacts=count, unavailable_layers=unavailable(model)
+            **model, verified_artifacts=count, unavailable_layers=missing, storage_bytes_by_peer=storage
         )
     resources = cat.setdefault("resources", {})
     for peer in cat["nodes"]:

@@ -1,5 +1,7 @@
 """Human-readable fleet snapshot (including snapshots from older peers)."""
 
+from itertools import groupby
+
 from .schema import Fields
 
 
@@ -10,6 +12,38 @@ def format_models(models: list[Fields]) -> str:
     rows = [f"{'MODEL':<{width}}  PEERS"]
     rows.extend(f"{m['name']:<{width}}  {m['peer_count']}" for m in models)
     return "\n".join(rows)
+
+
+def format_model_status(name: str, model: Fields) -> str:
+    owners: list[str] = model["owners"]
+    missing: dict[str, list[int]] = model["unavailable_layers"]
+    layers, peers = len(owners), len(set(owners))
+    unavailable = sum(map(len, missing.values()))
+    status = (f"{unavailable} layer{'s' if unavailable != 1 else ''} unavailable"
+              if unavailable else "All layer owners reachable")
+    storage: dict[str, int | None] = model["storage_bytes_by_peer"]
+    total = format_size(sum(size for size in storage.values() if size is not None))
+    unknown = sum(size is None for size in storage.values())
+    summary = (f"{total} known · {unknown} peer{'s' if unknown != 1 else ''} unreported"
+               if unknown else f"{total} total")
+    lines = [f"Model: {name} · {layers} layer{'s' if layers != 1 else ''} across "
+             f"{peers} peer{'s' if peers != 1 else ''}", f"Status: {status}", f"Storage: {summary}", ""]
+    spans: dict[str, list[str]] = {}
+    start = 0
+    for owner, group in groupby(owners):
+        end = start + sum(1 for _ in group)
+        span = str(start) if end == start + 1 else f"{start}–{end - 1}"
+        spans.setdefault(owner, []).append(span)
+        start = end
+    rows = [("PEER", "LAYERS", "STORED", "STATUS")]
+    for peer, size in storage.items():
+        reach = ("Unreachable" if peer in missing else "Reachable"
+                 if peer in spans or size is not None else "Unreported")
+        rows.append((peer[:8], ", ".join(spans.get(peer, [])) or "—",
+                     "Unknown" if size is None else format_size(size), reach))
+    widths = [max(map(len, column)) for column in zip(*rows)]
+    lines.extend("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in rows)
+    return "\n".join(lines)
 
 
 def format_size(value: int | None) -> str:

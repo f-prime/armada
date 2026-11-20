@@ -70,6 +70,7 @@ class Catalog(TypedDict):
 class NodeState(TypedDict):
     addr: str
     key: str
+    deleted_models: NotRequired[list[str]]
     api_keys: NotRequired[dict[str, ApiKey]]
     pair: NotRequired[str]
     leader: NotRequired[str]

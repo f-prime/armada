@@ -63,7 +63,18 @@ stdout still contains the JSON result.
 Run `armada model list` for an alphabetical inventory of fleet models and the
 number of distinct peers assigned layers for each. Use `armada model list --json`
 for scripts. The inventory includes models with offline peers; use
-`armada model status NAME` to check layer availability.
+`armada model status NAME` to see which peers own each layer range and whether
+they are reachable. **Stored** shows the size of that model's local shard files
+on every fleet peer (including peers with no assigned layers). `0 B` means no
+bytes reported for that model; `Unknown` means no measurement. The summary
+labels partial totals. Add `--json` for exact `storage_bytes_by_peer` values
+keyed by full node ID, with `null` for unknown sizes.
+
+`armada model delete NAME` removes the model from the fleet catalog and deletes
+its Armada shard directories. The source checkpoint is untouched. Use `--json`
+for the model ID and lists of confirmed and pending peers. Offline peers clean
+up on sync; reimporting the same name creates a separate generation. Upgrade
+all daemons for fleet-wide deletion support.
 
 Pass `--no-local-weights` to `model add` to keep the importing machine out of
 the placement. Once the manifest is shared, it can go offline.
@@ -202,7 +213,7 @@ URL as seen from the OpenCode service, and use your registered model name:
 }
 ```
 
-Set the model's `limit.context` to its `qwen.ctx` value from `armada model status coder`
+Set the model's `limit.context` to its `qwen.ctx` value from `armada model status coder --json`
 and choose a `limit.output` within that window. Make the inference key available to OpenCode and select `armada/coder` in
 `/models`. The client executes requested functions and sends their results
 back to the daemon.
