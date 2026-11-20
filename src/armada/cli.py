@@ -32,7 +32,6 @@ def main() -> int:
     daemon.set_defaults(op="daemon", keys=["host", "port"])
     fleet = groups.add_parser("peer", aliases=["fleet"]).add_subparsers(required=True)
     for name, op, keys in [
-        ("init", "init", ["name"]),
         ("add", "add", ["address"]),
         ("pairing-code", "pair", []),
         ("status", "status", []),

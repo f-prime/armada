@@ -52,10 +52,33 @@ from .placement import file_rpc, location, redistribute, verify
 ACTIVE: dict[str, int] = {}
 
 
+def memory_stats() -> tuple[int | None, int | None]:
+    """Available and total RAM in bytes, as reported by the local OS."""
+    free = total = None
+    if sys.platform == "linux":
+        with contextlib.suppress(OSError):
+            text = Path("/proc/meminfo").read_text()
+            sizes = dict(re.findall(r"^(\w+):\s+(\d+) kB$", text, re.MULTILINE))
+            if "MemTotal" in sizes:
+                total = int(sizes["MemTotal"]) * 1024
+            if "MemAvailable" in sizes:
+                free = int(sizes["MemAvailable"]) * 1024
+    elif sys.platform == "darwin":
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            total = int(subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True, timeout=3
+            ))
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            text = subprocess.check_output(["/usr/bin/vm_stat"], text=True, timeout=3)
+            page_size = re.search(r"page size of (\d+) bytes", text)
+            pages = dict(re.findall(r"^Pages (\w+):\s+(\d+)\.?$", text, re.MULTILINE))
+            if page_size and "free" in pages and "inactive" in pages:
+                free = (int(pages["free"]) + int(pages["inactive"])) * int(page_size[1])
+    return free, total
+
+
 def stats() -> Fields:
-    mem = dict(
-        line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines()
-    )
+    free_ram, total_ram = memory_stats()
     gpu = []
     if shutil.which("nvidia-smi"):
         with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
@@ -80,8 +103,8 @@ def stats() -> Fields:
     with LOCK:
         active = list(ACTIVE)
     return dict(
-        free_ram=int(mem["MemAvailable"].split()[0]) * 1024,
-        total_ram=int(mem["MemTotal"].split()[0]) * 1024,
+        free_ram=free_ram,
+        total_ram=total_ram,
         cpu_threads=os.cpu_count(),
         cpu_load_1m=os.getloadavg()[0],
         nvidia_gpus=gpu,
@@ -414,16 +437,13 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if op in ("inventory", "read-chunk", "link"):
             return file_rpc(op, b)
-        if op in ("pair", "init"):
+        if op == "pair":
             with LOCK:
                 s = state()
-                if op == "pair":
-                    check(len(s["peers"]) == 1, "node already paired")
-                    s["pair"] = secrets.token_urlsafe(24)
-                else:
-                    s["fleet"] = ident(b["name"])
+                check(len(s["peers"]) == 1, "node already paired")
+                s["pair"] = secrets.token_urlsafe(24)
                 save(home() / "node.json", s)
-                return s["pair"] if op == "pair" else True
+                return s["pair"]
         if op == "discard":
             shutil.rmtree(home() / "weights" / ident(b["id"]), ignore_errors=True)
             return True
@@ -525,8 +545,8 @@ def execute(args: list[str]) -> object:
                 )
                 server.serve_forever()
     s = state()
-    if op in ("init", "pair"):
-        return rpc(s["addr"], op, dict(name=a[0] if a else ""))
+    if op == "pair":
+        return rpc(s["addr"], "pair")
     if op == "add":
         code = (
             getpass.getpass("Peer pairing code: ")

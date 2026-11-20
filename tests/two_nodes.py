@@ -89,7 +89,6 @@ def test(
         if inspect_shards:
             inspect_shards(m, root)
         start(2)
-        cmd(2, "fleet", "init", "solo")
         cmd(2, *add)
         args = ("run", "tiny", "Once upon a time", "-n", "16")
         expected = cmd(2, *args)
