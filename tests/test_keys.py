@@ -91,6 +91,10 @@ class FleetKeysTest(unittest.TestCase):
         p.terminate()
         p.wait(timeout=5)
         self.assertEqual(len(key(0, "revoke", kid)["pending"]), 1)
+        before = Path(tmp, "0", "node.json").read_text()
+        with self.assertRaises(subprocess.CalledProcessError):
+            command(0, "fleet", "leave")
+        self.assertEqual(Path(tmp, "0", "node.json").read_text(), before)
         start(1, second)
         until = time.monotonic() + 15
         while status(second, new) != 401 and time.monotonic() < until:
@@ -98,3 +102,20 @@ class FleetKeysTest(unittest.TestCase):
         self.assertEqual(status(second, new), 401)
         self.assertEqual(json.loads(command(1, "key", "list", "--json")),
                          [dict(id=kid, status="revoked", name="editor")])
+        stale = json.loads(before)
+        command(1, "fleet", "leave")
+        self.assertEqual(json.loads(command(1, "key", "list", "--json")), [])
+        # A delayed snapshot must not resurrect the departed peer.
+        conn = HTTPConnection("127.0.0.1", first, timeout=3)
+        try:
+            conn.request("POST", "/sync", json.dumps(stale),
+                         headers={"Authorization": "Bearer " + stale["key"]})
+            reply = json.load(conn.getresponse())
+            self.assertEqual(list(reply["peers"]), [stale["uid"]])
+        finally:
+            conn.close()
+        start(2)
+        command(2, "fleet", "add", f"127.0.0.1:{second}", stdin=command(1, "fleet", "pairing-code") + "\n")
+        moved = json.loads(command(1, "status", "--json"))
+        self.assertEqual(len(moved["nodes"]), 2)
+        self.assertTrue(set(moved["nodes"]).isdisjoint(stale["peers"]))

@@ -51,7 +51,19 @@ def initialize(s: NodeState, local: str, advertised: str | None) -> None:
 
 def snapshot(s: NodeState) -> Fields:
     return dict(peers=s["peers"], models=s["models"], api_keys=s.get("api_keys", {}),
+                departed_peers=s.get("departed_peers", []),
                 deleted_models=s.get("deleted_models", []))
+
+
+def merge_departures(s: NodeState, data: Fields) -> bool:
+    old = set(s.get("departed_peers", []))
+    departed = old.union(ident(uid) for uid in data.get("departed_peers", [])) - {s["uid"]}
+    for uid in departed:
+        s["peers"].pop(uid, None)
+    if old == departed:
+        return False
+    s["departed_peers"] = sorted(departed)
+    return True
 
 
 def merge_models(s: NodeState, data: Fields) -> bool:
@@ -100,9 +112,10 @@ def merge(data: Fields) -> list[str]:
     with LOCK:
         s = state()
         changed = merge_keys(s, data.get("api_keys", {}))
+        changed |= merge_departures(s, data)
         for uid, record in data["peers"].items():
             ident(uid)
-            if uid != s["uid"] and (
+            if uid != s["uid"] and uid not in s.get("departed_peers", []) and (
                 uid not in s["peers"] or record["version"] > s["peers"][uid]["version"]
             ):
                 s["peers"][uid] = Peer(
@@ -130,8 +143,12 @@ def sync(key_id: str = "", local: NodeState | None = None, deleted: set[str] | N
     for peer in local["peers"]:
         if peer != local["uid"]:
             with contextlib.suppress(OSError, ValueError):
-                data = cast(Fields, rpc(peer, "sync", snapshot(local), timeout=3))
-                merge(data)
+                data = cast(Fields, rpc(local["peers"][peer]["endpoint"], "sync", snapshot(local),
+                                        key=local["key"], timeout=3))
+                with LOCK:
+                    if state()["key"] != local["key"]:
+                        return confirmed
+                    merge(data)
                 if (deleted and deleted.issubset(data.get("deleted_models", []))
                     and "cleanup_pending" in data and not deleted.intersection(data["cleanup_pending"])):
                     confirmed.append(peer)
@@ -144,6 +161,31 @@ def sync(key_id: str = "", local: NodeState | None = None, deleted: set[str] | N
                         continue
                     confirmed.append(peer)
     return confirmed
+
+
+def leave() -> str:
+    with LOCK:
+        s = state()
+        uid = s["uid"]
+        others = [entry for peer, entry in s["peers"].items() if peer != uid]
+        check(others or s.get("departed_peers"), "worker is already unpaired")
+        # One durable acknowledgment is sufficient: gossip carries the departure
+        # to offline peers, and a stale snapshot cannot resurrect the old UID.
+        for entry in others:
+            with contextlib.suppress(OSError, ValueError):
+                reply = cast(Fields, rpc(entry["endpoint"], "sync",
+                             dict(peers={}, models={}, departed_peers=[uid]), key=s["key"], timeout=3))
+                if uid in reply.get("departed_peers", []):
+                    break
+        else:
+            check(not others, "no peer acknowledged departure; bring an updated fleet peer online and retry")
+        fresh: NodeState = {"addr": s["addr"], "key": secrets.token_urlsafe(32)}
+        initialize(fresh, s["addr"], s["peers"][uid]["endpoint"])
+        weights = home() / "weights"
+        if weights.exists():
+            weights.rename(home() / ("weights-left-" + uid))
+        save(home() / "node.json", fresh)
+        return "Left fleet. Run `armada fleet pairing-code` to join another fleet."
 
 
 def delete_model(name: str, expected: str) -> Fields:
@@ -231,6 +273,7 @@ def enroll(b: Fields, auth: str) -> Fields:
         s = state()
         check(s.get("pair") and auth == "Bearer " + s["pair"], "invalid pairing code")
         check(len(s["peers"]) == 1, "add an unpaired node to an existing fleet")
+        check(not s.get("departed_peers"), "run armada fleet leave before pairing with another fleet")
         check(not set(s["models"]).intersection(b["models"]), "conflicting model names")
         uid = s["uid"]
         check(uid not in b["peers"], "already paired")
@@ -239,6 +282,7 @@ def enroll(b: Fields, auth: str) -> Fields:
         s["key"] = b["key"]
         del s["pair"]
         s["peers"].update(b["peers"])
+        merge_departures(s, b)
         merge_models(s, b)
         merge_keys(s, b.get("api_keys", {}))
         save(home() / "node.json", s)
@@ -260,5 +304,7 @@ def join(node: str, code: str, return_address: str | None) -> None:
         Fields,
         rpc(node, "enroll", dict(**snapshot(s), endpoint=node, key=s["key"]), key=code),
     )
-    merge(data)
+    with LOCK:
+        check(state()["key"] == s["key"], "fleet membership changed")
+        merge(data)
     sync()

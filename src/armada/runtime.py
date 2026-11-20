@@ -36,10 +36,11 @@ from .common import (
 from .qwen import gg_stage, import_gg
 from .bpe import load_tokenizer
 from .gpu import gpu_stats
+from .status import fleet_totals
 from .progress import Progress, terminal_progress
 from . import chat
 from .keys import authorized
-from .mesh import delete_model, key_command
+from .mesh import delete_model, key_command, leave
 
 from .mesh import (
     LOCK,
@@ -86,6 +87,7 @@ def memory_stats() -> tuple[int | None, int | None]:
 
 def stats() -> Fields:
     free_ram, total_ram = memory_stats()
+    disk = shutil.disk_usage(home())
     gpus = gpu_stats()
     with LOCK:
         active = list(ACTIVE)
@@ -97,7 +99,8 @@ def stats() -> Fields:
         gpus=gpus,
         nvidia_gpus=[{k: g[k] for k in ("name", "free_vram", "total_vram") if k in g}
                      for g in gpus if g.get("vendor") == "NVIDIA"],
-        free_disk=shutil.disk_usage(home()).free,
+        free_disk=disk.free,
+        total_disk=disk.total,
         shards={
             p.name: sum(f.stat().st_size for f in p.glob("*.bin"))
             for p in home().glob("weights/*")
@@ -537,6 +540,7 @@ class Handler(BaseHTTPRequestHandler):
             return s["uid"]
         if op == "sync":
             with LOCK:
+                check(state()["key"] == s["key"], "fleet membership changed")
                 pending = merge(b)
                 return dict(**snapshot(state()), cleanup_pending=pending)
         if op == "model-delete":
@@ -549,12 +553,17 @@ class Handler(BaseHTTPRequestHandler):
         if op == "join":
             join(b["node"], b["code"], b.get("return_address"))
             return True
+        if op == "leave":
+            token = json.loads((home() / "daemon.json").read_text())["token"]
+            check(hmac.compare_digest(token, b.get("token", "")), "unauthorized")
+            return leave()
         if op in ("inventory", "read-chunk", "link"):
             return file_rpc(op, b)
         if op == "pair":
             with LOCK:
                 s = state()
                 check(len(s["peers"]) == 1, "node already paired")
+                check(not s.get("departed_peers"), "run armada fleet leave before pairing with another fleet")
                 s["pair"] = secrets.token_urlsafe(24)
                 save(home() / "node.json", s)
                 return s["pair"]
@@ -675,6 +684,9 @@ def execute(args: list[str]) -> object:
     s = state()
     if op == "pair":
         return rpc(s["addr"], "pair")
+    if op == "leave":
+        token = json.loads((home() / "daemon.json").read_text())["token"]
+        return rpc(s["addr"], "leave", dict(token=token))
     if op.startswith("key-"):
         action = op.removeprefix("key-")
         return rpc(s["addr"], "manage-key", dict(action=action,
@@ -748,4 +760,4 @@ def execute(args: list[str]) -> object:
             resources[peer] = rpc(peer, "stats")
         except Exception as e:
             resources[peer] = {"error": str(e)}
-    return dict(**cat, peers=s["peers"], self=s["uid"])
+    return dict(**cat, peers=s["peers"], self=s["uid"], totals=fleet_totals(resources))

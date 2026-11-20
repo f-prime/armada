@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from armada import cli, gpu
 from armada.schema import Fields
+from armada.status import fleet_totals
 
 
 class FleetStatusTest(unittest.TestCase):
@@ -42,9 +43,27 @@ class FleetStatusTest(unittest.TestCase):
             self.assertNotIn("free_vram", found[0])
             self.assertEqual(found[1]["free_vram"], 3072)
 
+    def test_fleet_totals(self) -> None:
+        resources: dict[str, Fields] = {
+            "mac": dict(cpu_threads=8, total_ram=128, free_ram=0, total_disk=512,
+                        free_disk=32, gpus=[{"unified_memory": True, "total_vram": 128}]),
+            "pc": dict(cpu_threads=4, total_ram=64, free_ram=16, total_disk=256,
+                       free_disk=24, gpus=[{"free_vram": 4, "total_vram": 8}])}
+        self.assertEqual(fleet_totals(resources), dict(cpu_threads=12, total_ram=192,
+                         free_ram=16, total_disk=768, free_disk=56, gpu_count=2,
+                         free_vram=4, total_vram=8, partial=[]))
+        resources["old"] = {"cpu_threads": 2, "nvidia_gpus": [{"total_vram": 12}]}
+        totals = fleet_totals(resources)
+        self.assertEqual((totals["gpu_count"], totals["total_vram"]), (3, 20))
+        self.assertNotIn("cpu_threads", totals["partial"])
+        self.assertIn("total_vram", totals["partial"])
+        missing = fleet_totals({"offline": {"error": "timeout"}})
+        self.assertIsNone(missing["cpu_threads"])
+        self.assertIn("cpu_threads", missing["partial"])
+
     def test_cli_formats(self) -> None:
         snapshot: Fields = dict(fleet="home", nodes=["mac", "old", "failed"], models={},
-                                self="mac", resources={
+                                self="mac", peers={"failed": {"endpoint": "10.0.0.3:7318"}}, resources={
                                     "mac": {"gpus": [{"name": "Apple M4", "unified_memory": True}]},
                                     "old": {"nvidia_gpus": []}, "failed": {"error": "timeout"}})
         for args in (["status"], ["fleet", "status"], ["fleet", "status", "--json"]):
@@ -56,5 +75,6 @@ class FleetStatusTest(unittest.TestCase):
             if "--json" in args:
                 self.assertEqual(json.loads(out.getvalue()), snapshot)
             else:
-                for text in ("mac (you)", "Apple M4", "shared with RAM", "older peer", "timeout"):
+                for text in ("mac (you)", "Apple M4", "shared with RAM", "older peer", "timeout",
+                             "10.0.0.3", "Fleet totals:", "(partial)"):
                     self.assertIn(text, out.getvalue())

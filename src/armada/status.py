@@ -57,18 +57,64 @@ def format_size(value: int | None) -> str:
     raise AssertionError
 
 
+def fleet_totals(resources: dict[str, Fields]) -> Fields:
+    """Sum known capacity, tracking incomplete metrics independently."""
+    host_metrics = ("cpu_threads", "free_ram", "total_ram", "free_disk", "total_disk")
+    gpu_metrics = ("gpu_count", "free_vram", "total_vram")
+    values: dict[str, list[int | None]] = {key: [] for key in (*host_metrics, *gpu_metrics)}
+    for report in resources.values():
+        stats = {} if "error" in report else report
+        for key in host_metrics:
+            values[key].append(stats.get(key))
+        if "gpus" not in stats:
+            # Older peers only enumerate NVIDIA GPUs.
+            for key in gpu_metrics:
+                values[key].append(None)
+        gpus = stats.get("gpus", stats.get("nvidia_gpus"))
+        if gpus is None:
+            continue
+        values["gpu_count"].append(len(gpus))
+        dedicated = [gpu for gpu in gpus if not gpu.get("unified_memory")]
+        for key in ("free_vram", "total_vram"):
+            if dedicated:
+                values[key].extend(gpu.get(key) for gpu in dedicated)
+            else:
+                values[key].append(0)
+    totals: Fields = {}
+    for key, items in values.items():
+        known = [value for value in items if value is not None]
+        totals[key] = sum(known) if known else None
+    totals["partial"] = [key for key, items in values.items() if None in items]
+    return totals
+
+
 def format_status(snapshot: Fields) -> str:
     nodes, models = snapshot["nodes"], snapshot["models"]
     lines = [f"Fleet: {snapshot['fleet']} · {len(nodes)} node{'s' if len(nodes) != 1 else ''}"
              f" · {len(models)} model{'s' if len(models) != 1 else ''}"]
     if models:
         lines.append("Models: " + ", ".join(sorted(models)))
-    rows = [("NODE", "THREADS", "LOAD (1m)", "RAM FREE / TOTAL", "DISK FREE")]
+    totals = snapshot.get("totals")
+    if totals is None:
+        totals = fleet_totals({n: snapshot.get("resources", {}).get(n, {}) for n in nodes})
+
+    def metric(key: str) -> str:
+        value = totals[key]
+        text = ("—" if value is None else str(value)) if key in ("cpu_threads", "gpu_count") else format_size(value)
+        return text + (" (partial)" if key in totals["partial"] else "")
+
+    lines.extend([f"Fleet totals: {metric('cpu_threads')} CPU threads · {metric('gpu_count')} GPUs",
+                  "Free / total: " + " · ".join(
+                      f"{name}: {metric('free_' + key)} / {metric('total_' + key)}"
+                      for name, key in (("RAM", "ram"), ("disk", "disk"), ("dedicated VRAM", "vram")))])
+    rows = [("NODE", "ADDRESS", "THREADS", "LOAD (1m)", "RAM FREE / TOTAL", "DISK FREE")]
     details = []
     for node in nodes:
         label = node[:8]
         stats = snapshot.get("resources", {}).get(node, {})
+        endpoint = snapshot.get("peers", {}).get(node, {}).get("endpoint", "")
         rows.append((label + (" (you)" if node == snapshot.get("self") else ""),
+                     endpoint.rsplit(":", 1)[0] or "—",
                      str(stats.get("cpu_threads") or "—"),
                      f"{stats['cpu_load_1m']:.2f}" if stats.get("cpu_load_1m") is not None else "—",
                      f"{format_size(stats.get('free_ram'))} / {format_size(stats.get('total_ram'))}",

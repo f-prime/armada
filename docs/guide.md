@@ -146,6 +146,21 @@ all daemons for fleet-wide deletion support.
 Pass `--no-local-weights` to `model add` to keep the importing machine out of
 the placement. Once the manifest is shared, it can go offline.
 
+### Move a worker to another fleet
+
+On the worker you want to move, run `armada fleet leave` while its daemon is
+running. At least one remaining peer must be online and support `fleet leave`
+to acknowledge the departure. Other updated peers learn it when they next sync.
+The last worker in a fleet can leave without an acknowledgment.
+
+The worker keeps its address and starts with a fresh identity, fleet key, and
+empty catalog. Its old shards are preserved under `weights-left-<old-node-id>`
+in its Armada home. Models on the old fleet keep their placement; if the worker
+owned layers, use `armada model redistribute NAME` on a remaining peer.
+
+Run `armada fleet pairing-code` on the worker, then `armada fleet add HOST:PORT`
+on a member of the destination fleet and enter that code.
+
 ### Redistribute after a worker goes offline or a new peer joins
 
 ```sh
