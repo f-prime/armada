@@ -92,7 +92,7 @@ def gg_header(f: BinaryIO) -> tuple[Fields, list[Tensor]]:
 
 def gg_config(meta: Fields) -> QwenConfig:
     arch = meta.get("general.architecture")
-    check(arch in ("qwen3", "qwen3moe"), "expected qwen3 or qwen3moe GGUF")
+    check(arch in ("qwen3", "qwen3moe", "llama"), f"unsupported GGUF architecture: {arch}")
     moe = arch == "qwen3moe"
     prefix = f"{arch}."
     p = {k.removeprefix(prefix): v for k, v in meta.items() if k.startswith(prefix)}
@@ -113,6 +113,10 @@ def gg_config(meta: Fields) -> QwenConfig:
         scale=p.get("expert_weights_scale", 1.0),
         vocab=len(meta["tokenizer.ggml.tokens"]),
     )
+    if arch == "llama":
+        check(meta.get("tokenizer.ggml.pre") == "llama-bpe" and not p.get("expert_count"),
+              "expected a dense Llama 3 GGUF with llama-bpe tokenizer")
+        c["llama3"] = True
     check(
         hd % 2 == 0
         and heads % c["kv"] == 0
@@ -151,8 +155,7 @@ def gg_shapes(c: QwenConfig) -> Iterator[tuple[str, list[int], int]]:
             attn_q=[heads * hd, d],
             attn_k=[kv * hd, d],
             attn_v=[kv * hd, d],
-            attn_q_norm=[hd],
-            attn_k_norm=[hd],
+            **({} if c.get("llama3") else dict(attn_q_norm=[hd], attn_k_norm=[hd])),
             attn_output=[d, heads * hd],
             ffn_norm=[d],
             **ffn,
@@ -199,7 +202,8 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
                     c = gg_config(meta)
                     nodes = online(exclude_self)[: c["layers"]]
                     for node in nodes:
-                        rpc(node, "qwen3-ready" if not c["experts"] else "qwen-ready")
+                        rpc(node, "llama3-ready" if c.get("llama3") else
+                            "qwen3-ready" if not c["experts"] else "qwen-ready")
                     owners = [
                         nodes[i * len(nodes) // c["layers"]] for i in range(c["layers"])
                     ]
@@ -218,6 +222,9 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
                             "tokenizer.ggml.padding_token_id",
                         )
                     ]
+                    if c.get("llama3"):
+                        stops += [i for i, word in enumerate(meta["tokenizer.ggml.tokens"])
+                                  if word in ("<|eot_id|>", "<|eom_id|>") and i not in stops]
                     m = Model(
                         id=uid,
                         backend=meta["general.architecture"],
@@ -380,6 +387,10 @@ def gg_stage(
     )[:, None, :]
 
     def rope(a: FloatArray) -> FloatArray:
+        if c.get("llama3"):
+            even, odd = a[..., ::2], a[..., 1::2]
+            return np.stack((even * np.cos(pos) - odd * np.sin(pos),
+                             even * np.sin(pos) + odd * np.cos(pos)), axis=-1).reshape(a.shape)
         # GGUF Qwen uses NeoX layout (two half-vectors), not llama2.c's interleaved pairs.
         l, r = np.split(a, 2, axis=-1)
         return np.concatenate(
@@ -390,10 +401,11 @@ def gg_stage(
     for i in range(start, end):
         pre = f"blk.{i}."
         a = norm(x, pre + "attn_norm")
-        q = rope(
-            norm(mm(a, pre + "attn_q").reshape(seq, heads, hd), pre + "attn_q_norm")
-        )
-        k = rope(norm(mm(a, pre + "attn_k").reshape(seq, kv, hd), pre + "attn_k_norm"))
+        q = mm(a, pre + "attn_q").reshape(seq, heads, hd)
+        k = mm(a, pre + "attn_k").reshape(seq, kv, hd)
+        if not c.get("llama3"):
+            q, k = norm(q, pre + "attn_q_norm"), norm(k, pre + "attn_k_norm")
+        q, k = rope(q), rope(k)
         v = mm(a, pre + "attn_v").reshape(seq, kv, hd)
         score = np.einsum("thd,shd->hts", q, k.repeat(heads // kv, axis=1)) / np.sqrt(
             np.float32(hd)

@@ -10,7 +10,7 @@ faster generation.
 macOS has native RAM and GPU reporting; a physical mixed Linux/Mac inference
 benchmark is not yet published. GPU detection is for inventory, not execution.
 The NumPy backend supports legacy `llama2.c` completions and a subset of
-`qwen3` and `qwen3moe` GGUF v3 checkpoints with Qwen byte-level BPE. The chat API targets
+dense Llama 3, `qwen3` and `qwen3moe` GGUF v3 checkpoints. The chat API targets
 Qwen ChatML instruction models; arbitrary GGUF architectures and chat templates
 are not supported.
 
@@ -109,6 +109,17 @@ armada model add "$repo/stories260K.bin" --tokenizer "$repo/tok512.bin" --name s
 armada model status stories
 armada run stories 'Once upon a time' -n 32
 ```
+
+`armada run` prints text as it is generated. Add `--no-stream` to wait for the
+complete response. API clients can request the same incremental output with
+`"stream": true` on `/v1/completions`.
+
+Use `armada run -v stories 'Once upon a time'` to print a timing report to
+stderr with either output mode. First-token latency includes availability
+checks and prompt tokenization. The remaining tokens determine the fleet
+tokens/sec and each owner's average stage round-trip time (network and
+processing combined). Stop tokens are excluded. With fewer than two output
+tokens, the after-first metrics show `n/a`.
 
 `model status` should show `All layer owners reachable`, with layers and stored
 bytes on both peers. `run` should print a story continuation such as
@@ -212,6 +223,19 @@ replicas or automatic failover. The disk planner does not guarantee sufficient
 inference RAM for a particular context length. Finish active requests before
 redistributing; run one placement operation per model at a time. Catalog sync is
 eventual, not a distributed transaction.
+
+### Import dense Llama 3 GGUF
+
+Update Armada and restart each fleet daemon, then import the checkpoint and run
+a raw prompt:
+
+```sh
+armada model add --name ablit https://huggingface.co/QuantFactory/NeuralDaredevil-8B-abliterated-GGUF/resolve/main/NeuralDaredevil-8B-abliterated.Q8_0.gguf
+armada run ablit 'The capital of France is' -n 12
+```
+
+This supports dense `llama` GGUF v3 with the `llama-bpe` tokenizer and unscaled
+RoPE. Use `armada run` or `/v1/completions`; neither applies a chat template.
 
 ### Import dense Qwen3 GGUF
 

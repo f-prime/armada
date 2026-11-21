@@ -21,6 +21,7 @@ from collections.abc import Iterator, Sequence
 from typing import cast
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from functools import lru_cache
 import numpy as np
 from .schema import Fields, FloatArray, Model, NodeState, Payload
 from .common import (
@@ -411,9 +412,10 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
     return cast(list[list[float]], x.tolist())
 
 
-def generation(m: Model, prompt: str, count: int, stats: Fields) -> Iterator[int]:
+def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics: bool = False) -> Iterator[int]:
     import itertools
 
+    started = monotonic() if diagnostics else 0.0
     m = m.copy()
     m.pop("files", None)
     missing = unavailable(m)
@@ -427,17 +429,30 @@ def generation(m: Model, prompt: str, count: int, stats: Fields) -> Iterator[int
     tokens = rpc(owners[0], "tokenize", dict(model=m, prompt=prompt))
     check(0 < len(tokens) < ctx, "prompt is empty or exceeds context window")
     prompt_len = len(tokens)
+    stages: list[tuple[str, int, int]] = []
+    spans: dict[str, list[str]] = {}
+    start = 0
+    for node, group in itertools.groupby(owners):
+        end = start + sum(1 for _ in group)
+        stages.append((node, start, end))
+        if diagnostics:
+            spans.setdefault(node, []).append(str(start) if end == start + 1 else f"{start}–{end-1}")
+        start = end
 
     def steps() -> Iterator[int]:
         reason = "length"
         sampled = 0
+        first = last = 0.0
+        emitted = 0
+        totals = dict.fromkeys(spans, 0.0)
         for _ in range(min(count, ctx - prompt_len)):
             payload: Payload | int = tokens
-            start = 0
-            for node, group in itertools.groupby(owners):
-                end = start + sum(1 for _ in group)
+            elapsed: dict[str, float] = {}
+            for node, start, end in stages:
+                before = monotonic() if diagnostics else 0.0
                 payload = rpc(node, "stage", dict(model=m, start=start, end=end, payload=payload))
-                start = end
+                if diagnostics:
+                    elapsed[node] = elapsed.get(node, 0.0) + (monotonic() - before)
             if not isinstance(payload, int):
                 raise ValueError("final stage did not return a token ID")
             sampled += 1
@@ -445,27 +460,68 @@ def generation(m: Model, prompt: str, count: int, stats: Fields) -> Iterator[int
                 reason = "stop"
                 break
             tokens.append(payload)
+            if diagnostics:
+                last = monotonic()
+                if emitted == 0:
+                    first = last
+                else:
+                    for node, seconds in elapsed.items():
+                        totals[node] += seconds
+                emitted += 1
             yield payload
+        if diagnostics:
+            stats["diagnostics"] = dict(
+                first_ms=(first-started)*1000 if emitted else None,
+                tokens_per_second=(emitted-1)/(last-first) if emitted > 1 and last > first else None,
+                owners=[dict(owner=node, layers=", ".join(ranges),
+                             avg_ms=1000*totals[node]/(emitted-1) if emitted > 1 else None)
+                        for node, ranges in spans.items()])
         stats.update(finish_reason=reason, usage=dict(prompt_tokens=prompt_len,
                      completion_tokens=sampled, total_tokens=prompt_len + sampled))
     return steps()
 
 
-def generate(m: Model, prompt: str, count: int) -> str:
-    output = list(generation(m, prompt, count, {}))
+def generate(m: Model, prompt: str, count: int, stats: Fields | None = None) -> str:
+    output = list(generation(m, prompt, count, stats if stats is not None else {}, diagnostics=stats is not None))
     metadata = m.copy()
     metadata.pop("files", None)
     return str(rpc(m["owners"][0], "decode", dict(model=metadata, tokens=output)))
 
 
-def chat_pieces(m: Model, tokens: Iterator[int]) -> Iterator[str]:
+@lru_cache(maxsize=2)
+def legacy_tokenizer(path: Path, vocab: int) -> tuple[list[bytes], list[float]]:
+    return parse_tokenizer(path.read_bytes(), vocab)
+
+
+def legacy_piece(piece: bytes) -> bytes:
+    return bytes([int(piece[3:5], 16)]) if re.fullmatch(b"<0x[0-9A-Fa-f]{2}>", piece) else piece
+
+
+def token_pieces(m: Model, tokens: Iterator[int], *, chat_mode: bool = False) -> Iterator[str]:
     # The tokenizer may live on another machine. Decode raw bytes so a UTF-8
     # character split across tokens is emitted exactly once.
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     for token in tokens:
-        data = rpc(m["owners"][0], "chat-token", dict(id=m["id"], token=token))
+        body: Fields = dict(id=m["id"], token=token)
+        if "config" in m:
+            body["vocab"] = abs(m["config"][5])
+        data = rpc(m["owners"][0], "chat-token" if chat_mode else "completion-token", body)
         yield decoder.decode(bytes.fromhex(str(data)))
     yield decoder.decode(b"", final=True)
+
+
+def completion_chunks(name: str, model: Model, tokens: Iterator[int], stats: Fields) -> Iterator[Fields]:
+    def chunk(text: str, reason: str | None = None) -> Fields:
+        return dict(object="text_completion", model=name,
+                    choices=[dict(index=0, text=text, finish_reason=reason)])
+
+    for text in token_pieces(model, tokens):
+        if text:
+            yield chunk(text)
+    final = chunk("", stats["finish_reason"])
+    if "diagnostics" in stats:
+        final["diagnostics"] = stats["diagnostics"]
+    yield final
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -511,28 +567,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_reply(404, {"error": {"type": "invalid_request_error", "code": "model_not_found",
                                                 "message": "Unknown fleet model: " + b["model"]}})
                 return
-            if path == "/v1/completions":
-                check(not b.get("stream"), "streaming is supported on /v1/chat/completions")
-                check(isinstance(b.get("prompt"), str), "expected a text prompt")
-                self.json_reply(200, self.dispatch("v1/completions", b, s))
-                return
             model = models[b["model"]]
-            check(model.get("backend") in ("qwen3", "qwen3moe"), "chat requires a Qwen instruction model; use /v1/completions for base models")
-            check(b.get("n", 1) == 1, "only one completion is supported")
             check(isinstance(b.get("stream", False), bool), "stream must be a boolean")
-            check(not b.get("stop"), "custom stop sequences are not supported")
-            prompt, names = chat.prompt(b)
-            count = b.get("max_completion_tokens", b.get("max_tokens", min(1024, model["qwen"]["ctx"])))
-            check(type(count) is int and count > 0, "expected a positive token limit")
             stats: Fields = {}
-            tokens = generation(model, prompt, count, stats)
-            options = b.get("stream_options") or {}
-            check(isinstance(options, dict), "invalid stream_options")
-            chunks = chat.chunks(b["model"], chat_pieces(model, tokens), names, stats,
-                                 not b.get("stream") or options.get("include_usage", False))
-            if not b.get("stream"):
-                self.json_reply(200, chat.collect(chunks))
-                return
+            chunks: Iterator[Fields]
+            if path == "/v1/completions":
+                check(isinstance(b.get("prompt"), str), "expected a text prompt")
+                if not b.get("stream"):
+                    self.json_reply(200, self.dispatch("v1/completions", b, s))
+                    return
+                tokens = generation(model, b["prompt"], int(b.get("max_tokens", 32)), stats,
+                                    diagnostics=b.get("diagnostics") is True)
+                chunks = completion_chunks(b["model"], model, tokens, stats)
+            else:
+                check(model.get("backend") in ("qwen3", "qwen3moe"), "chat requires a Qwen instruction model; use /v1/completions for base models")
+                check(b.get("n", 1) == 1, "only one completion is supported")
+                check(not b.get("stop"), "custom stop sequences are not supported")
+                prompt, names = chat.prompt(b)
+                count = b.get("max_completion_tokens", b.get("max_tokens", min(1024, model["qwen"]["ctx"])))
+                check(type(count) is int and count > 0, "expected a positive token limit")
+                tokens = generation(model, prompt, count, stats)
+                options = b.get("stream_options") or {}
+                check(isinstance(options, dict), "invalid stream_options")
+                chunks = chat.chunks(b["model"], token_pieces(model, tokens, chat_mode=True), names, stats,
+                                     not b.get("stream") or options.get("include_usage", False))
+                if not b.get("stream"):
+                    self.json_reply(200, chat.collect(chunks))
+                    return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -607,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
             return key_command(b)
         if op == "stats":
             return stats()
-        if op in ("qwen-ready", "qwen3-ready"):
+        if op in ("qwen-ready", "qwen3-ready", "llama3-ready"):
             try:
                 import gguf
                 import regex
@@ -691,9 +752,12 @@ class Handler(BaseHTTPRequestHandler):
                     ACTIVE[uid] -= 1
                     if not ACTIVE[uid]:
                         del ACTIVE[uid]
-        if op == "chat-token":
-            tok = load_tokenizer(home() / "weights" / ident(b["id"]) / "tokenizer.bin")
-            return tok.decode_bytes([b["token"]], keep_special=True).hex()
+        if op in ("chat-token", "completion-token"):
+            path = home() / "weights" / ident(b["id"]) / "tokenizer.bin"
+            if "vocab" in b:
+                pieces, _ = legacy_tokenizer(path, b["vocab"])
+                return legacy_piece(pieces[b["token"]]).hex()
+            return load_tokenizer(path).decode_bytes([b["token"]], keep_special=op == "chat-token").hex()
         if op in ("tokenize", "decode"):
             m = b["model"]
             if "qwen" in m:
@@ -705,30 +769,25 @@ class Handler(BaseHTTPRequestHandler):
                     if op == "tokenize"
                     else tok.decode(b["tokens"])
                 )
-            pieces, scores = parse_tokenizer(
-                (home() / "weights" / ident(m["id"]) / "tokenizer.bin").read_bytes(),
+            pieces, scores = legacy_tokenizer(
+                home() / "weights" / ident(m["id"]) / "tokenizer.bin",
                 abs(m["config"][5]),
             )
             if op == "tokenize":
                 return encode(b["prompt"], pieces, scores)
 
-            def decode(p: bytes) -> bytes:
-                return (
-                    bytes([int(p[3:5], 16)])
-                    if re.fullmatch(b"<0x[0-9A-Fa-f]{2}>", p)
-                    else p
-                )
-
-            return b"".join(decode(pieces[i]) for i in b["tokens"]).decode(
+            return b"".join(legacy_piece(pieces[i]) for i in b["tokens"]).decode(
                 errors="replace"
             )
         if op == "v1/completions":
             m = catalog(s)["models"][b["model"]]
-            text = generate(m, b["prompt"], int(b.get("max_tokens", 32)))
+            timings: Fields | None = {} if b.get("diagnostics") is True else None
+            text = generate(m, b["prompt"], int(b.get("max_tokens", 32)), timings)
             return dict(
                 object="text_completion",
                 model=b["model"],
                 choices=[dict(index=0, text=text)],
+                **({"diagnostics": timings["diagnostics"]} if timings is not None else {}),
             )
         raise ValueError("unknown command")
 
@@ -825,12 +884,6 @@ def execute(args: list[str]) -> object:
             if op == "import":
                 return import_model(*a[:3], exclude_self=len(a) > 3, progress=progress)
             return import_gg(*a[:2], exclude_self=len(a) > 2, progress=progress)
-    if op == "run":
-        return rpc(
-            s["addr"],
-            "v1/completions",
-            dict(model=a[0], prompt=a[1], max_tokens=int(a[2])),
-        )["choices"][0]["text"]
     cat = catalog(s)
     if op in ("model-warm", "model-cold"):
         check(a[0] in cat["models"], f"unknown model: {a[0]}")

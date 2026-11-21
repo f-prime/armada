@@ -116,6 +116,8 @@ def main() -> int:
     run.add_argument("name")
     run.add_argument("prompt")
     run.add_argument("-n", "--tokens", type=int, default=32)
+    run.add_argument("--no-stream", action="store_true", help="print only the completed response")
+    run.add_argument("-v", "--verbose", action="store_true", help="report fleet and per-owner timings on stderr")
     run.set_defaults(op="run", keys=["name", "prompt", "tokens"])
     args = parser.parse_args(rest)
     if args.op == "daemon" and args.advertise_host:
@@ -151,6 +153,28 @@ def main() -> int:
             print(configure(args.op == "startup", getattr(args, "host", None) or "127.0.0.1",
                             7318 if getattr(args, "port", None) is None else args.port,
                             getattr(args, "advertise_host", None)))
+            return 0
+        if args.op == "run":
+            from .common import rpc, state, stream_completion
+            from .schema import Fields
+            from .status import format_timings
+
+            timings: Fields | None = {} if args.verbose else None
+            if args.no_stream:
+                request = dict(model=args.name, prompt=args.prompt, max_tokens=args.tokens)
+                if args.verbose:
+                    request["diagnostics"] = True
+                response = rpc(state()["addr"], "v1/completions", request)
+                print(response["choices"][0]["text"])
+                if timings is not None:
+                    timings.update(response.get("diagnostics", {}))
+            else:
+                for piece in stream_completion(args.name, args.prompt, args.tokens, timings):
+                    print(piece, end="", flush=True)
+                print(flush=True)
+            if timings is not None:
+                print(format_timings(timings, state()["peers"]) if timings else
+                      "Run diagnostics unavailable; update and restart the coordinating daemon.", file=sys.stderr)
             return 0
         from .runtime import execute
 

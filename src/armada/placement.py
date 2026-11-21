@@ -231,6 +231,9 @@ def redistribute(
     if tokenizer:
         m["tokenizer_source"] = location(tokenizer)
     targets = list(dict.fromkeys(m["owners"]))
+    if m.get("backend") == "llama":
+        for owner in targets:
+            rpc(owner, "llama3-ready")
     sources = {k: next((p for p in nodes if k in local[p]), None) for k in files}
     missing = {k for k, src in sources.items() if src is None}
     if progress:

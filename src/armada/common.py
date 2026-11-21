@@ -2,6 +2,8 @@ import json
 import os
 import re
 import secrets
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Literal, Protocol, cast, overload
 from urllib.error import HTTPError
@@ -65,6 +67,13 @@ def rpc(
     key: str | None = None,
     timeout: float | None = None,
 ) -> object:
+    with rpc_response(host, op, data, body, key, timeout) as response:
+        return json.load(response)
+
+
+@contextmanager
+def rpc_response(host: str, op: str, data: object = None, body: bytes | None = None,
+                 key: str | None = None, timeout: float | None = None) -> Iterator[BinaryIO]:
     s = state()
     if host in s.get("peers", {}):
         host = s["addr"] if host == s["uid"] else s["peers"][host]["endpoint"]
@@ -78,9 +87,29 @@ def rpc(
         with build_opener(ProxyHandler({})).open(
             req, timeout=timeout or float(os.environ.get("ARMADA_RPC_TIMEOUT", "300"))
         ) as r:
-            return json.load(r)
+            yield cast(BinaryIO, r)
     except HTTPError as e:
         raise ValueError(f"{host}: {e.read().decode()[:500]}") from e
+
+
+def stream_completion(model: str, prompt: str, count: int, diagnostics: Fields | None = None) -> Generator[str, None, None]:
+    body = dict(model=model, prompt=prompt, max_tokens=count, stream=True)
+    if diagnostics is not None:
+        body["diagnostics"] = True
+    with rpc_response(state()["addr"], "v1/completions", body) as response:
+        for line in response:
+            if not line.startswith(b"data: "):
+                continue
+            data = line[6:].strip()
+            if data == b"[DONE]":
+                return
+            event = json.loads(data)
+            if "error" in event:
+                raise ValueError(event["error"]["message"])
+            if diagnostics is not None and "diagnostics" in event:
+                diagnostics.update(event["diagnostics"])
+            yield event["choices"][0]["text"]
+    raise ValueError("completion stream ended unexpectedly")
 
 
 def catalog(s: NodeState) -> Catalog:

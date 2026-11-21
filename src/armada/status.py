@@ -2,7 +2,24 @@
 
 from itertools import groupby
 
-from .schema import Fields
+from .schema import Fields, Peer
+
+
+def format_timings(report: Fields, peers: dict[str, Peer]) -> str:
+    def ms(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.1f} ms"
+
+    rate = report["tokens_per_second"]
+    speed = "n/a" if rate is None else f"{rate:.2f} tokens/s"
+    lines = [f"First token: {ms(report['first_ms'])} · Generation after first token: {speed}"]
+    rows = [("OWNER", "LAYERS", "AVG ROUND TRIP / TOKEN AFTER FIRST")]
+    for row in report["owners"]:
+        owner = row["owner"]
+        label = peers[owner]["endpoint"] if owner in peers else owner
+        rows.append((label, row["layers"], ms(row["avg_ms"])))
+    widths = [max(map(len, column)) for column in zip(*rows)]
+    lines.extend("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in rows)
+    return "\n".join(lines)
 
 
 def format_models(models: list[Fields]) -> str:

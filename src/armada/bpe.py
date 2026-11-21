@@ -3,7 +3,7 @@
 from functools import lru_cache
 import json
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import regex
 
@@ -13,6 +13,7 @@ from .schema import Fields
 PATTERN = regex.compile(
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
+LLAMA_PATTERN = regex.compile(PATTERN.pattern.replace(r"\p{N}|", r"\p{N}{1,3}|"))
 _visible = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
 _missing = [b for b in range(256) if b not in _visible]
 BYTE = {b: chr(b if b in _visible else 256 + _missing.index(b)) for b in range(256)}
@@ -30,15 +31,18 @@ class BPEModel(TypedDict):
 
 
 class Document(TypedDict):
+    armada_llama3: NotRequired[bool]
+    armada_bos: NotRequired[int]
     model: BPEModel
     added_tokens: list[Added]
 
 
 def gg_tokenizer(meta: Fields) -> bytes:
+    llama = meta.get("general.architecture") == "llama"
     check(
         meta["tokenizer.ggml.model"] == "gpt2"
-        and meta["tokenizer.ggml.pre"] == "qwen2",
-        "expected Qwen byte-level BPE",
+        and meta["tokenizer.ggml.pre"] == ("llama-bpe" if llama else "qwen2"),
+        "unsupported GGUF byte-level BPE tokenizer",
     )
     words: list[str] = meta["tokenizer.ggml.tokens"]
     vocab = {w: i for i, w in enumerate(words)}
@@ -56,6 +60,13 @@ def gg_tokenizer(meta: Fields) -> bytes:
         if t in (3, 4)
     ]
     # Preserve the HF tokenizer JSON ABI for previous-version workers.
+    extra: Fields = {}
+    if llama:
+        extra["armada_llama3"] = True
+        if meta.get("tokenizer.ggml.add_bos_token", True):
+            bos = meta.get("tokenizer.ggml.bos_token_id")
+            check(type(bos) is int and 0 <= bos < len(words), "invalid Llama BOS token ID")
+            extra["armada_bos"] = bos
     return json.dumps(
         dict(
             version="1.0",
@@ -70,7 +81,7 @@ def gg_tokenizer(meta: Fields) -> bytes:
                 pretokenizers=[
                     dict(
                         type="Split",
-                        pattern={"Regex": PATTERN.pattern},
+                        pattern={"Regex": (LLAMA_PATTERN if llama else PATTERN).pattern},
                         behavior="Isolated",
                         invert=False,
                     ),
@@ -88,12 +99,15 @@ def gg_tokenizer(meta: Fields) -> bytes:
                 trim_offsets=True,
                 use_regex=True,
             ),
+            **extra,
         )
     ).encode()
 
 
 class Tokenizer:
     def __init__(self, doc: Document) -> None:
+        self.llama3 = doc.get("armada_llama3", False)
+        self.bos = doc.get("armada_bos")
         self.vocab = doc["model"]["vocab"]
         self.words = {i: w for w, i in self.vocab.items()}
         self.special = {a["content"] for a in doc["added_tokens"] if a["special"]}
@@ -112,13 +126,16 @@ class Tokenizer:
         }
 
     def encode(self, text: str) -> list[int]:
-        ids = []
+        ids = [] if self.bos is None else [self.bos]
         for part in self.split.split(text) if self.split else [text]:
             if part in self.added:
                 ids.append(self.vocab[part])
                 continue
-            for word in PATTERN.findall(part):
+            for word in (LLAMA_PATTERN if self.llama3 else PATTERN).findall(part):
                 tokens = [BYTE[b] for b in word.encode()]
+                if self.llama3 and (encoded := "".join(tokens)) in self.vocab:
+                    ids.append(self.vocab[encoded])
+                    continue
                 while len(tokens) > 1:
                     pairs = zip(tokens, tokens[1:])
                     best = min(

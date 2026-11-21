@@ -93,6 +93,7 @@ def test(
         cmd(2, *add)
         args = ("run", "tiny", "Once upon a time", "-n", "16")
         expected = cmd(2, *args)
+        assert cmd(2, *args, "--no-stream") == expected
         stop0, stop1 = start(0), start(1)
         cmd(1, "model", "warm", "tiny")
         status = json.loads(cmd(0, "model", "status", "tiny", "--json"))

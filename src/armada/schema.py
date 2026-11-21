@@ -12,6 +12,7 @@ type Fields = dict[str, Any]
 
 
 class QwenConfig(TypedDict):
+    llama3: NotRequired[bool]
     tied_output: NotRequired[bool]
     dim: int
     heads: int
