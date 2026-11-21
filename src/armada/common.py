@@ -45,7 +45,9 @@ def address(s: str) -> str:
 @overload
 def rpc(host: str, op: Literal["tokenize"], data: object) -> list[int]: ...
 @overload
-def rpc(host: str, op: Literal["stage", "stage-kv"], data: object) -> list[list[float]] | int: ...
+def rpc(host: str, op: Literal["stage"], data: object) -> list[list[float]] | int: ...
+@overload
+def rpc(host: str, op: Literal["stage-kv"], data: object) -> list[list[float]] | int | Fields: ...
 @overload
 def rpc(
     host: str, op: Literal["stats", "v1/completions"], data: object = None
@@ -92,8 +94,11 @@ def rpc_response(host: str, op: str, data: object = None, body: bytes | None = N
         raise ValueError(f"{host}: {e.read().decode()[:500]}") from e
 
 
-def stream_completion(model: str, prompt: str, count: int, diagnostics: Fields | None = None) -> Generator[str, None, None]:
-    body = dict(model=model, prompt=prompt, max_tokens=count, stream=True)
+def stream_completion(model: str, prompt: str, count: int, diagnostics: Fields | None = None,
+                      threads: list[int] | None = None) -> Generator[str, None, None]:
+    body: Fields = dict(model=model, prompt=prompt, max_tokens=count, stream=True)
+    if threads:
+        body["q8_threads"] = threads
     if diagnostics is not None:
         body["diagnostics"] = True
     with rpc_response(state()["addr"], "v1/completions", body) as response:

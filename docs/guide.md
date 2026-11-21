@@ -296,6 +296,31 @@ NumPy. From a `uv` checkout, check with
 For a comparison, set `ARMADA_NATIVE_Q8=0` in the worker environment before
 starting the daemon, then measure `armada run ... -v` with the same prompt.
 
+`armada model warm NAME` automatically tunes Q8_0 decode threads on each
+owner in parallel. On the first warm it times single-token passes over the
+actual local shard, then saves the fastest median setting beside that shard.
+Later requests (including after a restart) reuse it. A new placement, changed
+CPU availability, or rebuilt kernel triggers calibration on the next warm.
+Without a saved result, cold generation starts immediately with up to four
+threads. Small matrices run serially. Use `armada run NAME -v ...` to see
+what each worker selected; no thread flag is required.
+
+Optional overrides: `ARMADA_Q8_THREADS` (1–32) fixes the worker default
+and skips calibration. To override either setting for one run or compare
+fleet-wide throughput manually:
+
+```sh
+armada run ablit 'List the US states and their capitals.' -n 64 -v --q8-threads 4,2
+uv run python tools/bench_decode.py ablit --counts 1 2 4 8
+```
+
+Counts follow distinct owners in layer order; a single count applies to all.
+`-v` separates time inside each worker stage from remaining RPC overhead
+(including serialization and scheduling). The benchmark uses the non-streaming
+completion API, repeats each setting three times, checks for identical text,
+and tries the best per-owner combination before reporting fleet-wide median
+decode throughput. Restart updated daemons and warm the model once before testing.
+
 ### Legacy importer and placement
 
 Local paths also work. The legacy importer reads a remote checkpoint sequentially

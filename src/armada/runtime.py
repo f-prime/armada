@@ -60,7 +60,8 @@ from .mesh import (
     unavailable,
 )
 from .placement import destinations, file_rpc, location, redistribute, verify
-from .residency import PackedTensor, Weights, resident
+from .residency import MAX_THREADS, NATIVE_Q8, PackedTensor, Weights, q8_threads, resident
+from . import autotune
 
 ACTIVE: dict[str, int] = {}
 PREPARE = threading.Lock()
@@ -198,6 +199,29 @@ def prepare_weights(m: Model, node: str) -> Weights:
         else:
             weights[key] = PackedTensor.load(path, shape, warm=True)
     return weights
+
+
+def tune_decode(m: Model, node: str, weights: Weights) -> None:
+    if "qwen" not in m:
+        return
+    from itertools import groupby
+
+    spans = []
+    start = 0
+    for owner, group in groupby(m["owners"]):
+        end = start + sum(1 for _ in group)
+        if owner == node:
+            payload: Payload = [1] if start == 0 else [np.linspace(-1, 1, m["qwen"]["dim"]).tolist()]
+            spans.append((start, end, payload, KV()))
+        start = end
+
+    def decode() -> None:
+        for start, end, payload, cache in spans:
+            gg_stage(m, start, end, payload, weights_cache=weights, cache=cache)
+            # Reuse a fixed short context for all candidates.
+            cache.offset = min(1, m["qwen"]["ctx"] - 1)
+
+    autotune.calibrate(m["id"], weights, decode)
 
 
 def import_model(
@@ -390,7 +414,8 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
     return cast(list[list[float]], x.tolist())
 
 
-def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics: bool = False) -> Generator[int]:
+def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics: bool = False,
+               threads: list[int] | None = None) -> Generator[int]:
     import itertools
 
     started = monotonic() if diagnostics else 0.0
@@ -402,6 +427,13 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
         f"unavailable layers by owner: {missing}; bring the peer back or use model redistribute",
     )
     owners = m["owners"]
+    unique = list(dict.fromkeys(owners))
+    overrides = {}
+    if threads is not None:
+        check(isinstance(threads, list) and len(threads) in (1, len(unique))
+              and all(type(n) is int and 1 <= n <= MAX_THREADS for n in threads),
+              f"q8_threads expects one count or {len(unique)} counts between 1 and {MAX_THREADS}")
+        overrides = dict(zip(unique, threads * len(unique) if len(threads) == 1 else threads))
     ctx = m["qwen"]["ctx"] if "qwen" in m else m["config"][-1]
     check(0 < count <= ctx, "invalid token count")
     tokens = rpc(owners[0], "tokenize", dict(model=m, prompt=prompt))
@@ -426,16 +458,29 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
         first = last = 0.0
         emitted = 0
         totals = dict.fromkeys(spans, 0.0)
+        compute = dict.fromkeys(spans, 0.0)
+        measured: dict[str, int] = {}
         for step in range(min(count, ctx - prompt_len)):
             offset = prompt_len + step - 1 if step else 0
             payload: Payload | int = tokens[-1:] if step else tokens
             elapsed: dict[str, float] = {}
+            kernel: dict[str, float] = {}
             for node, start, end in stages:
                 before = monotonic() if diagnostics else 0.0
                 touched.add(node)
                 try:
-                    payload = rpc(node, "stage-kv", dict(model=m, start=start, end=end, payload=payload,
-                                                         request=request, offset=offset))
+                    body = dict(model=m, start=start, end=end, payload=payload,
+                                request=request, offset=offset, profile=diagnostics)
+                    if node in overrides:
+                        body["q8_threads"] = overrides[node]
+                    reply = rpc(node, "stage-kv", body)
+                    if isinstance(reply, dict):
+                        kernel[node] = kernel.get(node, 0.0) + reply["compute_s"]
+                        payload = reply["payload"]
+                        measured[node] = reply["q8_threads"]
+                    else:
+                        check(not overrides, f"{node}: update and restart worker to tune Q8 threads")
+                        payload = reply
                 except ValueError as exc:
                     if "unknown command" in str(exc):
                         raise ValueError(f"{node}: update and restart this worker for KV-cached decoding") from exc
@@ -456,13 +501,16 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
                 else:
                     for node, seconds in elapsed.items():
                         totals[node] += seconds
+                        compute[node] += kernel.get(node, 0.0)
                 emitted += 1
             yield payload
         if diagnostics:
             stats["diagnostics"] = dict(
                 first_ms=(first-started)*1000 if emitted else None,
                 tokens_per_second=(emitted-1)/(last-first) if emitted > 1 and last > first else None,
-                owners=[dict(owner=node, layers=", ".join(ranges),
+                 owners=[dict(owner=node, layers=", ".join(ranges),
+                              compute_ms=1000*compute[node]/(emitted-1) if emitted > 1 and node in measured else None,
+                              threads=measured.get(node),
                              avg_ms=1000*totals[node]/(emitted-1) if emitted > 1 else None)
                         for node, ranges in spans.items()])
         stats.update(finish_reason=reason, usage=dict(prompt_tokens=prompt_len,
@@ -477,8 +525,8 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
     return managed()
 
 
-def generate(m: Model, prompt: str, count: int, stats: Fields | None = None) -> str:
-    output = list(generation(m, prompt, count, stats if stats is not None else {}, diagnostics=stats is not None))
+def generate(m: Model, prompt: str, count: int, stats: Fields | None = None, threads: list[int] | None = None) -> str:
+    output = list(generation(m, prompt, count, stats if stats is not None else {}, diagnostics=stats is not None, threads=threads))
     metadata = m.copy()
     metadata.pop("files", None)
     return str(rpc(m["owners"][0], "decode", dict(model=metadata, tokens=output)))
@@ -574,7 +622,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.json_reply(200, self.dispatch("v1/completions", b, s))
                     return
                 tokens = generation(model, b["prompt"], int(b.get("max_tokens", 32)), stats,
-                                    diagnostics=b.get("diagnostics") is True)
+                                     diagnostics=b.get("diagnostics") is True, threads=b.get("q8_threads"))
                 chunks = completion_chunks(b["model"], model, tokens, stats)
             else:
                 check(model.get("backend") in ("qwen3", "qwen3moe"), "chat requires a Qwen instruction model; use /v1/completions for base models")
@@ -730,9 +778,9 @@ class Handler(BaseHTTPRequestHandler):
                     if op == "model-cold":
                         resident.pop(uid, None)
                         return True
-                    if uid in resident:
-                        return True
-                prepared = prepare_weights(m, s["uid"])
+                    warm = resident.get(uid)
+                prepared = warm if warm is not None else prepare_weights(m, s["uid"])
+                tune_decode(m, s["uid"], prepared)
                 with LOCK:
                     latest = state()["models"].get(b["name"])
                     check(latest is not None and latest["id"] == uid, "model placement changed")
@@ -747,12 +795,23 @@ class Handler(BaseHTTPRequestHandler):
                 ACTIVE[uid] = ACTIVE.get(uid, 0) + 1
                 cached = resident.get(uid)
             try:
+                count = b["q8_threads"] if "q8_threads" in b else autotune.selected(uid)
+                check(type(count) is int and 1 <= count <= MAX_THREADS, "invalid Q8 thread count")
                 scope = (session((b["request"], uid, b["start"], b["end"]), b["offset"], len(b["payload"]))
                          if op == "stage-kv" else contextlib.nullcontext(None))
-                with scope as cache:
-                    if "qwen" in b["model"]:
-                        return gg_stage(b["model"], b["start"], b["end"], b["payload"], weights_cache=cached, cache=cache)
-                    return stage(b["model"], b["start"], b["end"], b["payload"], weights=cached, cache=cache)
+                ticket = q8_threads.set(count)
+                try:
+                    timed = b.get("profile") or "q8_threads" in b
+                    before = monotonic() if timed else 0.0
+                    with scope as cache:
+                        if "qwen" in b["model"]:
+                            result = gg_stage(b["model"], b["start"], b["end"], b["payload"], weights_cache=cached, cache=cache)
+                        else:
+                            result = stage(b["model"], b["start"], b["end"], b["payload"], weights=cached, cache=cache)
+                    return dict(payload=result, compute_s=monotonic()-before,
+                                q8_threads=count if NATIVE_Q8 else 0) if timed else result
+                finally:
+                    q8_threads.reset(ticket)
             finally:
                 with LOCK:
                     ACTIVE[uid] -= 1
@@ -788,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
         if op == "v1/completions":
             m = catalog(s)["models"][b["model"]]
             timings: Fields | None = {} if b.get("diagnostics") is True else None
-            text = generate(m, b["prompt"], int(b.get("max_tokens", 32)), timings)
+            text = generate(m, b["prompt"], int(b.get("max_tokens", 32)), timings, threads=b.get("q8_threads"))
             return dict(
                 object="text_completion",
                 model=b["model"],

@@ -105,7 +105,7 @@ def test(
                 for p in folder.glob("*.bin"):
                     if p.stem != "tokenizer":
                         restore.callback(p.rename(p.with_suffix(".held")).rename, p)
-            assert cmd(0, *args) == expected
+            assert cmd(0, *args, "--q8-threads", "2,4", "-v") == expected
         stop1()
         offline = json.loads(cmd(0, "model", "status", "tiny", "--json"))
         assert offline["warmth_by_owner"][ids[1]] == "unknown"

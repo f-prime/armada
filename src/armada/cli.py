@@ -116,6 +116,7 @@ def main() -> int:
     run.add_argument("name")
     run.add_argument("prompt")
     run.add_argument("-n", "--tokens", type=int, default=32)
+    run.add_argument("--q8-threads", help="Q8 decode threads: one count for all owners, or comma-separated counts in layer order")
     run.add_argument("--no-stream", action="store_true", help="print only the completed response")
     run.add_argument("-v", "--verbose", action="store_true", help="report fleet and per-owner timings on stderr")
     run.set_defaults(op="run", keys=["name", "prompt", "tokens"])
@@ -160,8 +161,11 @@ def main() -> int:
             from .status import format_timings
 
             timings: Fields | None = {} if args.verbose else None
+            threads = [int(n) for n in args.q8_threads.split(",")] if args.q8_threads else None
             if args.no_stream:
-                request = dict(model=args.name, prompt=args.prompt, max_tokens=args.tokens)
+                request: Fields = dict(model=args.name, prompt=args.prompt, max_tokens=args.tokens)
+                if threads:
+                    request["q8_threads"] = threads
                 if args.verbose:
                     request["diagnostics"] = True
                 response = rpc(state()["addr"], "v1/completions", request)
@@ -169,7 +173,7 @@ def main() -> int:
                 if timings is not None:
                     timings.update(response.get("diagnostics", {}))
             else:
-                for piece in stream_completion(args.name, args.prompt, args.tokens, timings):
+                for piece in stream_completion(args.name, args.prompt, args.tokens, timings, threads):
                     print(piece, end="", flush=True)
                 print(flush=True)
             if timings is not None:

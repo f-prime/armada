@@ -12,11 +12,14 @@ def format_timings(report: Fields, peers: dict[str, Peer]) -> str:
     rate = report["tokens_per_second"]
     speed = "n/a" if rate is None else f"{rate:.2f} tokens/s"
     lines = [f"First token: {ms(report['first_ms'])} · Generation after first token: {speed}"]
-    rows = [("OWNER", "LAYERS", "AVG ROUND TRIP / TOKEN AFTER FIRST")]
+    rows = [("OWNER", "LAYERS", "AVG ROUND TRIP / TOKEN AFTER FIRST", "WORKER", "RPC OVERHEAD", "Q8 THREADS")]
     for row in report["owners"]:
         owner = row["owner"]
         label = peers[owner]["endpoint"] if owner in peers else owner
-        rows.append((label, row["layers"], ms(row["avg_ms"])))
+        compute = row.get("compute_ms")
+        overhead = max(0.0, row["avg_ms"] - compute) if compute is not None else None
+        rows.append((label, row["layers"], ms(row["avg_ms"]), ms(compute), ms(overhead),
+                     str(row["threads"]) if row.get("threads") is not None else "n/a"))
     widths = [max(map(len, column)) for column in zip(*rows)]
     lines.extend("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in rows)
     return "\n".join(lines)
