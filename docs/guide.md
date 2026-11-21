@@ -149,9 +149,11 @@ labels partial totals. Add `--json` for exact `storage_bytes_by_peer` values
 keyed by full node ID, with `null` for unknown sizes.
 
 Use `armada model warm NAME` before the first prompt to load each owner's
-weights into RAM. Each daemon keeps its own shard as prepared float32 weights
-(four bytes per parameter), which can require much more RAM than the stored
-files. Subsequent `armada run` and API requests reuse those weights.
+weights into RAM. Each daemon keeps its own shard in its stored encoding:
+a 4 GiB quantized shard needs about 4 GiB for resident weights. Subsequent
+`armada run` and API requests reuse them, decoding matrix rows in blocks for
+multiplication. Inference needs additional RAM for those blocks, activations,
+and attention, which grows with the prompt length.
 `armada model cold NAME` releases them without deleting the model.
 `armada model status NAME` reports memory state per owner and for the model;
 unreachable or older owners report `unknown`. If a command fails on one owner,
@@ -270,8 +272,9 @@ layers plus input/output tensors on the end nodes. Disk is checked per shard.
 The full 480B model has **not** been run on a physical fleet.
 
 Armada sends 8 MiB chunks, checks their SHA-256 on receipt, and persists each
-tensor only on its owner. At inference it memory-maps those files, dequantizes
-matrix rows in tiles, and evaluates only the routed experts per token.
+tensor only on its owner. Inference reads packed weights from RAM when warm
+or from memory-mapped files when cold. It dequantizes matrix rows in tiles
+and evaluates only the routed experts per token.
 Supported tensor encodings are F32/F16/BF16, Q8_0, Q4_0/1, Q5_0/1 and
 Q2_K through Q6_K. Use an unscaled-RoPE, separate-Q/K/V, untied-output
 `qwen3moe` checkpoint. This does not implement arbitrary GGUF architectures.

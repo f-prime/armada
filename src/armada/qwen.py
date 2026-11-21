@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from typing import Any, BinaryIO, cast
 import gguf
 import numpy as np
-from numpy.typing import NDArray
+from .residency import PackedTensor, Weights
 from .common import catalog, check, home, ident, open_source, readn, rpc, state
 from .schema import Fields, FloatArray, Model, Payload, QwenConfig, Tensor
 from .bpe import gg_tokenizer
@@ -324,47 +324,25 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
 
 def gg_stage(
     m: Model, start: int, end: int, payload: Payload, return_logits: bool = False,
-    *, weights_cache: dict[str, FloatArray] | None = None,
+    *, weights_cache: Weights | None = None,
 ) -> FloatArray | int | list[list[float]]:
-    import gguf
-
     c = m["qwen"]
     folder = home() / "weights" / ident(m["id"])
     manifest: dict[str, tuple[str, list[int], int]] = json.loads(
         (folder / "manifest.bin").read_bytes()
     ) if weights_cache is None else {}
 
-    def rows(
-        name: str, expert: int | None = None
-    ) -> tuple[NDArray[np.uint8], gguf.GGMLQuantizationType]:
+    def tensor(name: str) -> PackedTensor:
+        if weights_cache is not None:
+            return weights_cache[name + ".weight"]
         key, shape, code = manifest[name + ".weight"]
-        qt = gguf.GGMLQuantizationType(code)
-        block, size = gguf.GGML_QUANT_SIZES[qt]
-        data = np.memmap(
-            folder / (ident(key) + ".bin"),
-            dtype="u1",
-            mode="r",
-            shape=(*shape[:-1], shape[-1] // block * size),
-        )
-        return (data if expert is None else data[expert]), qt
+        return PackedTensor.load(folder / (ident(key) + ".bin"), tuple(shape), code)
 
     def mm(x: FloatArray, name: str, expert: int | None = None) -> FloatArray:
-        if weights_cache is not None:
-            weight = weights_cache[name + ".weight"]
-            return x @ (weight if expert is None else weight[expert]).T
-        data, qt = rows(name, expert)
-        # Bound float32 scratch, including for the vocabulary projection.
-        out = np.empty((*x.shape[:-1], len(data)), dtype="f4")
-        for j in range(0, len(data), 256):
-            out[..., j : j + 256] = x @ gguf.dequantize(data[j : j + 256], qt).T
-        return out
+        return tensor(name).multiply(x, expert)
 
     def norm(x: FloatArray, name: str) -> FloatArray:
-        if weights_cache is None:
-            w, qt = rows(name)
-            scale = gguf.dequantize(w, qt)
-        else:
-            scale = weights_cache[name + ".weight"]
+        scale = tensor(name).decode()
         return np.asarray(
             (x / np.sqrt((x * x).mean(axis=-1, keepdims=True) + c["eps"]))
             * scale,
@@ -373,11 +351,7 @@ def gg_stage(
 
     if start == 0:
         idx = np.asarray(payload, dtype=np.intp)
-        if weights_cache is None:
-            emb, qt = rows("token_embd")
-            x = gguf.dequantize(emb[idx], qt)
-        else:
-            x = weights_cache["token_embd.weight"][idx]
+        x = tensor("token_embd").decode(idx)
     else:
         x = np.asarray(payload, dtype="f4")
     hd, heads, kv = c["hd"], c["heads"], c["kv"]

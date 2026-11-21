@@ -59,7 +59,7 @@ from .mesh import (
     unavailable,
 )
 from .placement import destinations, file_rpc, location, redistribute, verify
-from .residency import Weights, resident
+from .residency import PackedTensor, Weights, resident
 
 ACTIVE: dict[str, int] = {}
 PREPARE = threading.Lock()
@@ -176,15 +176,14 @@ def layout(c: Sequence[int]) -> Iterator[tuple[str, tuple[int, ...], int | None]
 
 
 def prepare_weights(m: Model, node: str) -> Weights:
-    """Expand this owner's verified tensor inventory to independent float32 arrays."""
-    import math
+    """Read this owner's verified tensors into RAM in their on-disk encoding."""
 
     folder = home() / "weights" / ident(m["id"])
     local = {k: f for k, f in m["files"].items()
              if k != "tokenizer" and node in destinations(m, k, f)}
     legacy = {k: dims for k, dims, _ in layout(m["config"])} if "config" in m else {}
     shapes = {k: tuple(f["tensor"][1]) if "tensor" in f else legacy[k] for k, f in local.items()}
-    needed = sum(4 * math.prod(shape) for shape in shapes.values())
+    needed = sum(f["size"] for f in local.values())
     available, _ = memory_stats()
     check(available is None or available > needed, f"need {needed} available RAM bytes")
     weights: Weights = {}
@@ -193,23 +192,10 @@ def prepare_weights(m: Model, node: str) -> Weights:
         shape = shapes[key]
         check(path.stat().st_size == artifact["size"], f"incomplete shard: {key}")
         if "tensor" in artifact:
-            import gguf
-
             name, _, code = artifact["tensor"]
-            qt = gguf.GGMLQuantizationType(code)
-            block, size = gguf.GGML_QUANT_SIZES[qt]
-            raw = np.memmap(path, dtype="u1", mode="r").reshape(-1, shape[-1] // block * size)
-            data = np.empty(shape, dtype="f4")
-            rows = data.reshape(-1, shape[-1])
-            for j in range(0, len(rows), 256):
-                rows[j:j+256] = gguf.dequantize(raw[j:j+256], qt)
-            weights[name] = data
-        elif len(shape) == 1:
-            weights[key] = np.fromfile(path, dtype="<f4").reshape(shape)
+            weights[name] = PackedTensor.load(path, shape, code, warm=True)
         else:
-            scales = np.memmap(path, dtype="<f4", mode="r", shape=(shape[0], 1))
-            quantized = np.memmap(path, dtype="i1", mode="r", offset=4 * shape[0], shape=shape)
-            weights[key] = np.asarray(quantized * scales, dtype=np.float32)
+            weights[key] = PackedTensor.load(path, shape, warm=True)
     return weights
 
 
@@ -342,29 +328,21 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
     folder = home() / "weights" / ident(m["id"])
     hd = d // heads
 
-    def matrix(
-        key: str, rows: int, cols: int, index: Payload | None = None
-    ) -> FloatArray:
+    def tensor(key: str, shape: tuple[int, ...]) -> PackedTensor:
         if weights is not None:
-            return weights[key] if index is None else weights[key][np.asarray(index, dtype=np.intp)]
-        path = folder / (key + ".bin")
-        scale = np.memmap(path, dtype="<f4", mode="r", shape=(rows, 1))
-        q = np.memmap(path, dtype="i1", mode="r", offset=4 * rows, shape=(rows, cols))
-        if index is not None:
-            idx = np.asarray(index, dtype=np.intp)
-            return np.asarray(q[idx] * scale[idx], dtype=np.float32)
-        return np.asarray(q * scale, dtype=np.float32)
+            return weights[key]
+        return PackedTensor.load(folder / (key + ".bin"), shape)
 
     def norm(x: FloatArray, key: str) -> FloatArray:
         return np.asarray(
             x
             / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + 1e-5)
-            * (weights[key] if weights is not None else np.fromfile(folder / (key + ".bin"), "<f4")),
+            * tensor(key, (d,)).decode(),
             dtype=np.float32,
         )
 
     x = (
-        matrix("emb", abs(vocab), d, payload)
+        tensor("emb", (abs(vocab), d)).decode(np.asarray(payload, dtype=np.intp))
         if start == 0
         else np.asarray(payload, dtype=np.float32)
     )
@@ -383,7 +361,7 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
     for i in range(start, end):
 
         def mm(x: FloatArray, key: str, rows: int, cols: int) -> FloatArray:
-            return x @ matrix(f"{key}_{i}", rows, cols).T
+            return tensor(f"{key}_{i}", (rows, cols)).multiply(x)
 
         a = norm(x, f"an_{i}")
         q = rotate(mm(a, "q", d, d).reshape(seq, heads, hd))
@@ -406,7 +384,7 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
         )
     if end == n:
         logits = (
-            norm(x[-1], "norm") @ matrix("emb" if vocab > 0 else "out", abs(vocab), d).T
+            tensor("emb" if vocab > 0 else "out", (abs(vocab), d)).multiply(norm(x[-1], "norm"))
         )
         return int(np.argmax(logits))
     return cast(list[list[float]], x.tolist())
