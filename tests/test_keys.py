@@ -95,7 +95,7 @@ class FleetKeysTest(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             command(0, "fleet", "leave")
         self.assertEqual(Path(tmp, "0", "node.json").read_text(), before)
-        start(1, second)
+        returned, _ = start(1, second)
         until = time.monotonic() + 15
         while status(second, new) != 401 and time.monotonic() < until:
             time.sleep(0.1)
@@ -119,3 +119,17 @@ class FleetKeysTest(unittest.TestCase):
         moved = json.loads(command(1, "status", "--json"))
         self.assertEqual(len(moved["nodes"]), 2)
         self.assertTrue(set(moved["nodes"]).isdisjoint(stale["peers"]))
+        uid = moved["self"]
+        returned.terminate()
+        returned.wait(timeout=5)
+        self.assertIn(uid, command(2, "fleet", "remove", uid[:8]))
+        self.assertNotIn(uid, json.loads(command(2, "status", "--json"))["nodes"])
+        start(1, second)
+        deadline = time.monotonic() + 15
+        while json.loads(Path(tmp, "1", "node.json").read_text())["uid"] == uid:
+            self.assertLess(time.monotonic(), deadline, "returning worker did not detach")
+            time.sleep(0.1)
+        endpoint = f"127.0.0.1:{second}"
+        command(2, "fleet", "add", endpoint, stdin=command(1, "fleet", "pairing-code") + "\n")
+        command(2, "fleet", "remove", endpoint)
+        self.assertEqual(len(json.loads(command(1, "status", "--json"))["nodes"]), 1)

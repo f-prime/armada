@@ -161,6 +161,22 @@ owned layers, use `armada model redistribute NAME` on a remaining peer.
 Run `armada fleet pairing-code` on the worker, then `armada fleet add HOST:PORT`
 on a member of the destination fleet and enter that code.
 
+### Remove another worker
+
+On a remaining fleet member, run `armada status`, then use the node ID shown
+in the `NODE` column (or its full ID or registered `host:port`):
+
+```sh
+armada fleet remove NODE_ID
+```
+
+The peer can be offline. Its removal propagates to the remaining workers by
+sync. An updated removed worker resets to an unpaired identity when notified,
+or when it next syncs with a peer that knows of its removal. As with `leave`,
+old shards are preserved locally. Run `armada model redistribute NAME` for each
+affected model listed by the command. Removal updates membership; it does not
+rotate the shared secret on the remaining fleet.
+
 ### Redistribute after a worker goes offline or a new peer joins
 
 ```sh

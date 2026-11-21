@@ -42,7 +42,7 @@ from .status import fleet_totals
 from .progress import Progress, terminal_progress
 from . import chat
 from .keys import authorized
-from .mesh import delete_model, key_command, leave
+from .mesh import delete_model, detach, key_command, leave, remove_peer
 
 from .mesh import (
     LOCK,
@@ -576,7 +576,13 @@ class Handler(BaseHTTPRequestHandler):
             return s["uid"]
         if op == "sync":
             with LOCK:
-                check(state()["key"] == s["key"], "fleet membership changed")
+                current = state()
+                check(current["key"] == s["key"], "fleet membership changed")
+                if current["uid"] in b.get("departed_peers", []):
+                    detach(current)
+                    return dict(peers={}, models={}, departed_peers=[current["uid"]])
+                if b.get("sender") in current.get("departed_peers", []):
+                    return dict(peers={}, models={}, departed_peers=[b["sender"]])
                 pending = merge(b)
                 return dict(**snapshot(state()), cleanup_pending=pending)
         if op == "model-delete":
@@ -589,10 +595,10 @@ class Handler(BaseHTTPRequestHandler):
         if op == "join":
             join(b["node"], b["code"], b.get("return_address"))
             return True
-        if op == "leave":
+        if op in ("leave", "remove-peer"):
             token = json.loads((home() / "daemon.json").read_text())["token"]
             check(hmac.compare_digest(token, b.get("token", "")), "unauthorized")
-            return leave()
+            return leave() if op == "leave" else remove_peer(b["peer"])
         if op in ("inventory", "read-chunk", "link"):
             return file_rpc(op, b)
         if op == "pair":
@@ -720,9 +726,9 @@ def execute(args: list[str]) -> object:
     s = state()
     if op == "pair":
         return rpc(s["addr"], "pair")
-    if op == "leave":
+    if op in ("leave", "remove-peer"):
         token = json.loads((home() / "daemon.json").read_text())["token"]
-        return rpc(s["addr"], "leave", dict(token=token))
+        return rpc(s["addr"], op, dict(token=token, peer=a[0] if a else ""))
     if op.startswith("key-"):
         action = op.removeprefix("key-")
         return rpc(s["addr"], "manage-key", dict(action=action,

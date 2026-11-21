@@ -55,6 +55,9 @@ def main() -> int:
     groups.add_parser("unstartup", help="stop and remove the boot service").set_defaults(op="unstartup")
     fleet = groups.add_parser("fleet").add_subparsers(required=True)
     fleet.add_parser("leave", help="leave the current fleet and unpair this worker").set_defaults(op="leave", keys=[])
+    remove = fleet.add_parser("remove", help="remove another worker, even if it is offline")
+    remove.add_argument("peer", help="node ID, unique ID prefix from status, or host:port")
+    remove.set_defaults(op="remove-peer", keys=["peer"])
     for name, op, keys in [
         ("add", "add", ["address"]),
         ("pairing-code", "pair", []),

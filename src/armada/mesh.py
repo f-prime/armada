@@ -143,11 +143,15 @@ def sync(key_id: str = "", local: NodeState | None = None, deleted: set[str] | N
     for peer in local["peers"]:
         if peer != local["uid"]:
             with contextlib.suppress(OSError, ValueError):
-                data = cast(Fields, rpc(local["peers"][peer]["endpoint"], "sync", snapshot(local),
+                data = cast(Fields, rpc(local["peers"][peer]["endpoint"], "sync", dict(**snapshot(local), sender=local["uid"]),
                                         key=local["key"], timeout=3))
                 with LOCK:
-                    if state()["key"] != local["key"]:
+                    current = state()
+                    if current["key"] != local["key"]:
                         return confirmed
+                    if current["uid"] in data.get("departed_peers", []):
+                        detach(current)
+                        return []
                     merge(data)
                 if (deleted and deleted.issubset(data.get("deleted_models", []))
                     and "cleanup_pending" in data and not deleted.intersection(data["cleanup_pending"])):
@@ -161,6 +165,39 @@ def sync(key_id: str = "", local: NodeState | None = None, deleted: set[str] | N
                         continue
                     confirmed.append(peer)
     return confirmed
+
+
+def detach(s: NodeState) -> None:
+    """Reset local membership, retaining previous shards as for a voluntary leave."""
+    uid = s["uid"]
+    fresh: NodeState = {"addr": s["addr"], "key": secrets.token_urlsafe(32)}
+    initialize(fresh, s["addr"], s["peers"][uid]["endpoint"])
+    weights = home() / "weights"
+    if weights.exists():
+        weights.rename(home() / ("weights-left-" + uid))
+    save(home() / "node.json", fresh)
+
+
+def remove_peer(selector: str) -> str:
+    with LOCK:
+        s = state()
+        matches = [uid for uid, record in s["peers"].items()
+                   if uid.startswith(selector) or record["endpoint"] == selector]
+        check(selector and matches, f"unknown peer: {selector}")
+        check(len(matches) == 1, "ambiguous peer; use the full node ID")
+        uid = matches[0]
+        check(uid != s["uid"], "use armada fleet leave to remove this worker")
+        endpoint = s["peers"][uid]["endpoint"]
+        notice = dict(peers={}, models={}, departed_peers=[uid])
+        merge_departures(s, notice)
+        save(home() / "node.json", s)
+    # Notify the target separately: it is no longer in our gossip directory.
+    with contextlib.suppress(OSError, ValueError):
+        rpc(endpoint, "sync", notice, key=s["key"], timeout=3)
+    sync(local=s)
+    affected = [name for name, m in s["models"].items() if uid in m["owners"]]
+    return f"Removed peer {uid} ({endpoint})." + (
+        "\nModels needing redistribution: " + ", ".join(sorted(affected)) if affected else "")
 
 
 def leave() -> str:
@@ -179,12 +216,7 @@ def leave() -> str:
                     break
         else:
             check(not others, "no peer acknowledged departure; bring an updated fleet peer online and retry")
-        fresh: NodeState = {"addr": s["addr"], "key": secrets.token_urlsafe(32)}
-        initialize(fresh, s["addr"], s["peers"][uid]["endpoint"])
-        weights = home() / "weights"
-        if weights.exists():
-            weights.rename(home() / ("weights-left-" + uid))
-        save(home() / "node.json", fresh)
+        detach(s)
         return "Left fleet. Run `armada fleet pairing-code` to join another fleet."
 
 
