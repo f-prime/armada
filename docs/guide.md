@@ -279,9 +279,22 @@ Supported tensor encodings are F32/F16/BF16, Q8_0, Q4_0/1, Q5_0/1 and
 Q2_K through Q6_K. Use an unscaled-RoPE, separate-Q/K/V, untied-output
 `qwen3moe` checkpoint. This does not implement arbitrary GGUF architectures.
 
-Start with short prompts: prefix recomputation and quadratic attention make
-long contexts expensive. For slow runs set `ARMADA_RPC_TIMEOUT` (seconds,
+Workers process the prompt once, keeping per-layer attention keys and values in
+RAM for the request. Later decode steps send one activation row per stage.
+Initial prompt attention is still quadratic, and each decode step attends to
+the prior context. Update and restart all layer owners before using an updated
+coordinator; no model reimport is needed. For slow runs set `ARMADA_RPC_TIMEOUT` (seconds,
 default 300) on the CLI and daemons.
+
+Q8_0 single-token decode uses an optional native CPU kernel (AVX2 on
+supported x86 machines, NEON on Apple Silicon, otherwise scalar C). It reads
+packed weights directly. Prompt batches and other quantizations still use the
+NumPy path. Reinstall Armada from the checkout and restart each daemon to
+pick up the extension. If no C compiler is available, inference falls back to
+NumPy. From a `uv` checkout, check with
+`uv run python -c 'from armada.residency import NATIVE_Q8; print(NATIVE_Q8)'`.
+For a comparison, set `ARMADA_NATIVE_Q8=0` in the worker environment before
+starting the daemon, then measure `armada run ... -v` with the same prompt.
 
 ### Legacy importer and placement
 
@@ -304,7 +317,7 @@ peer endpoints, model metadata, and persisted shard sizes.
 
 Restart daemons with the same data directories. Only the requesting peer and
 workers holding required stages need to be online for inference.
-The reference backend recomputes the prefix and exchanges JSON activations;
+The reference backend exchanges JSON activations between stages;
 it favors a small, inspectable implementation over throughput.
 
 ## OpenAI-compatible inference API and OpenCode

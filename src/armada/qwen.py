@@ -14,6 +14,7 @@ from .residency import PackedTensor, Weights
 from .common import catalog, check, home, ident, open_source, readn, rpc, state
 from .schema import Fields, FloatArray, Model, Payload, QwenConfig, Tensor
 from .bpe import gg_tokenizer
+from .kv import KV, attention
 from .progress import Progress
 import math
 
@@ -324,7 +325,7 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
 
 def gg_stage(
     m: Model, start: int, end: int, payload: Payload, return_logits: bool = False,
-    *, weights_cache: Weights | None = None,
+    *, weights_cache: Weights | None = None, cache: KV | None = None,
 ) -> FloatArray | int | list[list[float]]:
     c = m["qwen"]
     folder = home() / "weights" / ident(m["id"])
@@ -356,7 +357,8 @@ def gg_stage(
         x = np.asarray(payload, dtype="f4")
     hd, heads, kv = c["hd"], c["heads"], c["kv"]
     seq = len(x)
-    pos = np.outer(np.arange(seq), c["theta"] ** (-np.arange(0, hd, 2) / hd)).astype(
+    offset = cache.offset if cache else 0
+    pos = np.outer(np.arange(offset, offset + seq), c["theta"] ** (-np.arange(0, hd, 2) / hd)).astype(
         "f4"
     )[:, None, :]
 
@@ -381,16 +383,9 @@ def gg_stage(
             q, k = norm(q, pre + "attn_q_norm"), norm(k, pre + "attn_k_norm")
         q, k = rope(q), rope(k)
         v = mm(a, pre + "attn_v").reshape(seq, kv, hd)
-        score = np.einsum("thd,shd->hts", q, k.repeat(heads // kv, axis=1)) / np.sqrt(
-            np.float32(hd)
-        )
-        score[:, np.triu(np.ones((seq, seq), bool), 1)] = -np.inf
-        att = np.exp(score - score.max(axis=-1, keepdims=True))
-        a = np.einsum(
-            "hts,shd->thd",
-            att / att.sum(axis=-1, keepdims=True),
-            v.repeat(heads // kv, axis=1),
-        )
+        if cache:
+            k, v = cache.append(i, k, v, c["ctx"])
+        a = attention(q, k, v)
         x = x + mm(a.reshape(seq, -1), pre + "attn_output")
         a = norm(x, pre + "ffn_norm")
         if not c["experts"]:

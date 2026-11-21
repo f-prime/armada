@@ -15,6 +15,11 @@ dependencies = ["numpy>=1.26,<3", "gguf==0.18.0", "regex"]
 [project.scripts]
 armada = "armada.cli:main"
 
+[[tool.setuptools.ext-modules]]
+name = "armada._q8"
+sources = ["src/armada/_q8.c"]
+optional = true
+
 [dependency-groups]
 checks = ["mypy", "types-regex"]
 dev = [{include-group = "checks"}, "llama-cpp-python==0.3.37"]

@@ -4,3 +4,5 @@ dist/
 build/
 *.egg-info/
 __pycache__/
+src/armada/_q8*.so
+src/armada/_q8*.pyd

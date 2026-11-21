@@ -20,15 +20,18 @@ class InferenceTest(unittest.TestCase):
         self.prompts: list[str] = []
         self.resume: threading.Event | None = None
 
-        def rpc(node: str, op: str, body: Fields) -> object:
+        def rpc(node: str, op: str, body: Fields, **kwargs: object) -> object:
             if op == "tokenize":
                 self.prompts.append(body["prompt"])
                 return [999]
             if op == "decode":
                 return bytes(body["tokens"]).decode()
-            if op == "stage":
+            if op == "release-kv":
+                return True
+            if op == "stage-kv":
                 if node == "a":
-                    return [[len(body["payload"]) - 1]]
+                    self.assertEqual(len(body["payload"]), 1)
+                    return [[body["offset"]]]
                 i = body["payload"][0][0]
                 if i == 1 and self.resume is not None:
                     self.assertTrue(self.resume.wait(timeout=5), "client buffered the first token")

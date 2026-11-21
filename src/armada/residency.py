@@ -1,6 +1,7 @@
 """Prepared weights keyed by immutable model generation. Mutations use mesh.LOCK."""
 
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .schema import FloatArray
+
+try:
+    from ._q8 import matvec
+except ImportError:
+    matvec = None  # type: ignore[assignment]
+
+NATIVE_Q8 = matvec is not None and os.getenv("ARMADA_NATIVE_Q8", "1") != "0"
 
 
 @dataclass
@@ -43,6 +51,11 @@ class PackedTensor:
     def multiply(self, x: FloatArray, expert: int | None = None) -> FloatArray:
         rows, cols = self.shape[-2:]
         out = np.empty((*x.shape[:-1], rows), dtype="f4")
+        if (NATIVE_Q8 and matvec is not None and x.size == cols
+                and self.qt == gguf.GGMLQuantizationType.Q8_0):
+            packed = self.data if expert is None else self.data[expert]
+            matvec(packed, np.require(x, dtype=np.float32, requirements=["C", "A"]), out)
+            return out
         # Target at most 4 MiB of decoded weights (or one very wide row).
         step = max(1, min(256, 2**20 // cols))
         for j in range(0, rows, step):

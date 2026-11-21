@@ -17,7 +17,7 @@ import threading
 from queue import Empty, Queue
 from time import monotonic
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from typing import cast
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +38,7 @@ from .common import (
 )
 from .qwen import gg_stage, import_gg
 from .bpe import load_tokenizer
+from .kv import KV, attention, expire, release, session
 from .gpu import gpu_stats
 from .status import fleet_totals
 from .progress import Progress, terminal_progress
@@ -322,8 +323,9 @@ def encode(prompt: str, pieces: list[bytes], scores: list[float]) -> list[int]:
     return tokens
 
 
-def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights | None = None) -> int | list[list[float]]:
-    """Evaluate one contiguous decoder stage, recomputing the prefix (no KV cache)."""
+def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights | None = None,
+          cache: KV | None = None) -> int | list[list[float]]:
+    """Evaluate the supplied positions of a contiguous decoder stage."""
     d, h, n, heads, kv, vocab, ctx = m["config"]
     folder = home() / "weights" / ident(m["id"])
     hd = d // heads
@@ -347,8 +349,9 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
         else np.asarray(payload, dtype=np.float32)
     )
     seq = len(x)
-    check(0 < seq <= ctx, "context limit exceeded")
-    angles = np.outer(np.arange(seq), 10000 ** (-np.arange(0, hd, 2) / hd)).astype(
+    offset = cache.offset if cache else 0
+    check(0 < seq and offset + seq <= ctx, "context limit exceeded")
+    angles = np.outer(np.arange(offset, offset + seq), 10000 ** (-np.arange(0, hd, 2) / hd)).astype(
         np.float32
     )[:, None, :]
 
@@ -365,14 +368,11 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
 
         a = norm(x, f"an_{i}")
         q = rotate(mm(a, "q", d, d).reshape(seq, heads, hd))
-        k = rotate(mm(a, "k", kv * hd, d).reshape(seq, kv, hd)).repeat(
-            heads // kv, axis=1
-        )
-        v = mm(a, "v", kv * hd, d).reshape(seq, kv, hd).repeat(heads // kv, axis=1)
-        att = np.einsum("thd,shd->hts", q, k) / np.sqrt(np.float32(hd))
-        att[:, np.triu_indices(seq, 1)[0], np.triu_indices(seq, 1)[1]] = -np.inf
-        att = np.exp(att - att.max(axis=-1, keepdims=True))
-        a = np.einsum("hts,shd->thd", att / att.sum(axis=-1, keepdims=True), v)
+        k = rotate(mm(a, "k", kv * hd, d).reshape(seq, kv, hd))
+        v = mm(a, "v", kv * hd, d).reshape(seq, kv, hd)
+        if cache:
+            k, v = cache.append(i, k, v, ctx)
+        a = attention(q, k, v)
         x = x + mm(a.reshape(seq, d), "o", d, d)
         a = norm(x, f"fn_{i}")
         gate = mm(a, "w1", h, d)
@@ -390,7 +390,7 @@ def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights 
     return cast(list[list[float]], x.tolist())
 
 
-def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics: bool = False) -> Iterator[int]:
+def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics: bool = False) -> Generator[int]:
     import itertools
 
     started = monotonic() if diagnostics else 0.0
@@ -417,18 +417,29 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
             spans.setdefault(node, []).append(str(start) if end == start + 1 else f"{start}–{end-1}")
         start = end
 
+    request = secrets.token_hex(16)
+    touched: set[str] = set()
+
     def steps() -> Iterator[int]:
         reason = "length"
         sampled = 0
         first = last = 0.0
         emitted = 0
         totals = dict.fromkeys(spans, 0.0)
-        for _ in range(min(count, ctx - prompt_len)):
-            payload: Payload | int = tokens
+        for step in range(min(count, ctx - prompt_len)):
+            offset = prompt_len + step - 1 if step else 0
+            payload: Payload | int = tokens[-1:] if step else tokens
             elapsed: dict[str, float] = {}
             for node, start, end in stages:
                 before = monotonic() if diagnostics else 0.0
-                payload = rpc(node, "stage", dict(model=m, start=start, end=end, payload=payload))
+                touched.add(node)
+                try:
+                    payload = rpc(node, "stage-kv", dict(model=m, start=start, end=end, payload=payload,
+                                                         request=request, offset=offset))
+                except ValueError as exc:
+                    if "unknown command" in str(exc):
+                        raise ValueError(f"{node}: update and restart this worker for KV-cached decoding") from exc
+                    raise
                 if diagnostics:
                     elapsed[node] = elapsed.get(node, 0.0) + (monotonic() - before)
             if not isinstance(payload, int):
@@ -456,7 +467,14 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
                         for node, ranges in spans.items()])
         stats.update(finish_reason=reason, usage=dict(prompt_tokens=prompt_len,
                      completion_tokens=sampled, total_tokens=prompt_len + sampled))
-    return steps()
+    def managed() -> Generator[int]:
+        try:
+            yield from steps()
+        finally:
+            for node in touched:
+                with contextlib.suppress(OSError, ValueError):
+                    rpc(node, "release-kv", dict(request=request), timeout=3)
+    return managed()
 
 
 def generate(m: Model, prompt: str, count: int, stats: Fields | None = None) -> str:
@@ -520,6 +538,7 @@ class Handler(BaseHTTPRequestHandler):
     def inference(self, method: str) -> None:
         path = self.path.partition("?")[0]
         streaming = False
+        tokens: Generator[int] | None = None
         try:
             s = state()
             auth = self.headers.get("Authorization", "").encode()
@@ -593,6 +612,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b"data: " + json.dumps(error).encode() + b"\n\ndata: [DONE]\n\n")
             else:
                 self.json_reply(status, error)
+        finally:
+            if tokens is not None:
+                tokens.close()
 
     def do_POST(self) -> None:
         if self.path.partition("?")[0].startswith("/v1/"):
@@ -716,15 +738,21 @@ class Handler(BaseHTTPRequestHandler):
                     check(latest is not None and latest["id"] == uid, "model placement changed")
                     resident[uid] = prepared
             return True
-        if op == "stage":
+        if op == "release-kv":
+            release(b["request"])
+            return True
+        if op in ("stage", "stage-kv"):
             uid = b["model"]["id"]
             with LOCK:
                 ACTIVE[uid] = ACTIVE.get(uid, 0) + 1
                 cached = resident.get(uid)
             try:
-                if "qwen" in b["model"]:
-                    return gg_stage(b["model"], b["start"], b["end"], b["payload"], weights_cache=cached)
-                return stage(b["model"], b["start"], b["end"], b["payload"], weights=cached)
+                scope = (session((b["request"], uid, b["start"], b["end"]), b["offset"], len(b["payload"]))
+                         if op == "stage-kv" else contextlib.nullcontext(None))
+                with scope as cache:
+                    if "qwen" in b["model"]:
+                        return gg_stage(b["model"], b["start"], b["end"], b["payload"], weights_cache=cached, cache=cache)
+                    return stage(b["model"], b["start"], b["end"], b["payload"], weights=cached, cache=cache)
             finally:
                 with LOCK:
                     ACTIVE[uid] -= 1
@@ -825,6 +853,7 @@ def execute(args: list[str]) -> object:
                 request = home() / ("stop-" + token)
                 while not request.exists():
                     server.handle_request()
+                    expire()
                 request.unlink()
                 return "Armada stopped."
     s = state()

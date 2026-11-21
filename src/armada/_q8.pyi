@@ -1,0 +1,3 @@
+from collections.abc import Buffer
+
+def matvec(weights: Buffer, vector: Buffer, output: Buffer) -> None: ...

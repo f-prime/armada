@@ -6,6 +6,7 @@ import tempfile
 import os
 from unittest.mock import patch
 from armada.qwen import gg_stage
+from armada.kv import KV
 from armada.bpe import load_tokenizer
 from armada.schema import Model
 import gguf
@@ -123,6 +124,17 @@ def compare(dense: bool, llama: bool = False) -> None:
                 # ggml also quantizes activations for the Q8 dot product;
                 # NumPy uses float activations with dequantized GGUF rows.
                 np.testing.assert_allclose(actual, logits, atol=0.035, rtol=0.02)
+                left, right = KV(), KV()
+                for part in (ids[:-2], ids[-2:-1], ids[-1:]):
+                    with patch.dict(os.environ, ARMADA_HOME=str(root / "0")):
+                        row = gg_stage(m, 0, 1, part, cache=left)
+                        assert isinstance(row, list) and len(row) == len(part)
+                    with patch.dict(os.environ, ARMADA_HOME=str(root / "1")):
+                        incremental = gg_stage(m, 1, 2, row, return_logits=True, cache=right)
+                        assert isinstance(incremental, np.ndarray)
+                    left.offset += len(part)
+                    right.offset += len(part)
+                np.testing.assert_allclose(incremental, actual, atol=2e-5, rtol=2e-5)
 
         os.environ["ARMADA_HOME"] = tmp
         test(path, reference=reference, inspect_shards=inspect)
