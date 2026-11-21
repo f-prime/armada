@@ -2,17 +2,35 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from armada import cli, gpu
+from armada import cli, gpu, runtime
 from armada.schema import Fields
 from armada.status import fleet_totals
 
 
 class FleetStatusTest(unittest.TestCase):
+    def test_slow_nodes_do_not_hold_up_fleet(self) -> None:
+        release = threading.Event()
+
+        def probe(peer: str, op: str, timeout: float) -> Fields:
+            if peer != "fast":
+                release.wait(2)
+            return {"cpu_threads": 4}
+
+        try:
+            with patch.object(runtime, "rpc", side_effect=probe):
+                reports = runtime._fleet_resources(["slow", "fast", "stalled"], timeout=0.2)
+        finally:
+            release.set()
+        self.assertEqual(reports["fast"], {"cpu_threads": 4})
+        for peer in ("slow", "stalled"):
+            self.assertEqual(reports[peer], {"error": "did not respond in time"})
+
     def test_macos_inventory(self) -> None:
         report = {"SPDisplaysDataType": [{"sppci_model": "Apple M4"},
                   {"sppci_model": "Radeon Pro", "spdisplays_vram": "8 GB"}]}
@@ -62,7 +80,7 @@ class FleetStatusTest(unittest.TestCase):
         self.assertIn("cpu_threads", missing["partial"])
 
     def test_cli_formats(self) -> None:
-        snapshot: Fields = dict(fleet="home", nodes=["mac", "old", "failed"], models={},
+        snapshot: Fields = dict(fleet="home", nodes=["mac", "old", "failed", "missing"], models={},
                                 self="mac", peers={"failed": {"endpoint": "10.0.0.3:7318"}}, resources={
                                     "mac": {"gpus": [{"name": "Apple M4", "unified_memory": True}]},
                                     "old": {"nvidia_gpus": []}, "failed": {"error": "timeout"}})
@@ -75,6 +93,9 @@ class FleetStatusTest(unittest.TestCase):
             if "--json" in args:
                 self.assertEqual(json.loads(out.getvalue()), snapshot)
             else:
+                for row in (r"mac \(you\)\s+Online", r"old\s+Online", r"failed\s+Offline",
+                            r"missing\s+Unknown"):
+                    self.assertRegex(out.getvalue(), rf"(?m)^{row}\s")
                 for text in ("mac (you)", "Apple M4", "shared with RAM", "older peer", "timeout",
                              "10.0.0.3", "Fleet totals:", "(partial)"):
                     self.assertIn(text, out.getvalue())

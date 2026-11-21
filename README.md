@@ -55,7 +55,7 @@ armada run stories 'Once upon a time' -n 32
 ## Supported models
 
 Armada supports legacy `llama2.c` completions (including TinyStories) and a
-subset of `qwen3moe` GGUF v3 checkpoints. Chat requires a supported Qwen ChatML
+subset of dense `qwen3` and `qwen3moe` GGUF v3 checkpoints. Chat requires a supported Qwen ChatML
 instruction model. Inference is CPU-only and integration-tested on Linux.
 
 ## Usage guide
@@ -63,5 +63,6 @@ instruction model. Inference is CPU-only and integration-tested on Linux.
 - [Start workers on boot and configure networking](docs/guide.md#five-minute-quickstart-two-peers-and-tinystories)
 - [Inspect, redistribute, or delete fleet models](docs/guide.md#operating-a-fleet)
 - [Import Qwen3-Coder GGUF](docs/guide.md#import-qwen3-coder-gguf)
+- [Import dense Qwen3-1.7B GGUF](docs/guide.md#import-dense-qwen3-gguf)
 - [Use the OpenAI-compatible API or connect OpenCode](docs/guide.md#openai-compatible-inference-api-and-opencode)
 - [Run the integration checks](docs/guide.md#reproduce-the-integration-check)

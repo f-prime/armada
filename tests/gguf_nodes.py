@@ -1,4 +1,4 @@
-"""Generate a split Q8_0 Qwen3 MoE and check Armada against unpartitioned llama.cpp."""
+"""Compare dense and MoE split Q8_0 Qwen3 models against llama.cpp."""
 
 from pathlib import Path
 from contextlib import closing
@@ -13,9 +13,9 @@ from llama_cpp import Llama
 from two_nodes import test
 
 
-def fixture(path: Path) -> str:
+def fixture(path: Path, dense: bool) -> str:
     rng = np.random.default_rng(203)
-    w = gguf.GGUFWriter(path, "qwen3moe", split_max_tensors=15)
+    w = gguf.GGUFWriter(path, "qwen3" if dense else "qwen3moe", split_max_tensors=15)
     d, heads, kv, hd, n, e, k, h = 64, 4, 2, 32, 2, 4, 2, 64
     words = ["<eos>", "Ġ"] + [chr(i) for i in range(33, 127)] + ["On"]
     for key, val in dict(
@@ -27,10 +27,7 @@ def fixture(path: Path) -> str:
         head_count_kv=kv,
         key_length=hd,
         value_length=hd,
-        feed_forward_length=2 * h,
-        expert_feed_forward_length=h,
-        expert_count=e,
-        expert_used_count=k,
+        feed_forward_length=h if dense else 2 * h,
         layer_norm_rms_eps=1e-6,
         rope_freq_base=1000000.0,
         tokenizer_model="gpt2",
@@ -42,6 +39,10 @@ def fixture(path: Path) -> str:
         add_bos_token=False,
     ).items():
         getattr(w, "add_" + key)(val)
+    if not dense:
+        w.add_expert_feed_forward_length(h)
+        w.add_expert_count(e)
+        w.add_expert_used_count(k)
 
     def weight(name: str, shape: tuple[int, ...]) -> None:
         data = (
@@ -57,7 +58,8 @@ def fixture(path: Path) -> str:
 
     weight("token_embd", (len(words), d))
     weight("output_norm", (d,))
-    weight("output", (len(words), d))
+    if not dense:
+        weight("output", (len(words), d))
     for i in range(n):
         for key, shape in dict(
             attn_q=(heads * hd, d),
@@ -68,12 +70,16 @@ def fixture(path: Path) -> str:
             attn_norm=(d,),
             attn_output=(d, heads * hd),
             ffn_norm=(d,),
-            ffn_gate_inp=(e, d),
-            ffn_up_exps=(e, h, d),
-            ffn_gate_exps=(e, h, d),
-            ffn_down_exps=(e, d, h),
         ).items():
             weight(f"blk.{i}.{key}", shape)
+        if dense:
+            for key, shape in dict(gate=(h, d), up=(h, d), down=(d, h)).items():
+                weight(f"blk.{i}.ffn_{key}", shape)
+        else:
+            weight(f"blk.{i}.ffn_gate_inp", (e, d))
+            weight(f"blk.{i}.ffn_up_exps", (e, h, d))
+            weight(f"blk.{i}.ffn_gate_exps", (e, h, d))
+            weight(f"blk.{i}.ffn_down_exps", (e, d, h))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -81,9 +87,9 @@ def fixture(path: Path) -> str:
     return str(sorted(path.parent.glob("*.gguf"))[0])
 
 
-if __name__ == "__main__":
+def compare(dense: bool) -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        path = fixture(Path(tmp) / "tiny.gguf")
+        path = fixture(Path(tmp) / "tiny.gguf", dense)
         with closing(
             Llama(
                 model_path=path, n_ctx=128, n_threads=1, logits_all=True, verbose=False
@@ -115,3 +121,8 @@ if __name__ == "__main__":
 
         os.environ["ARMADA_HOME"] = tmp
         test(path, reference=reference, inspect_shards=inspect)
+
+
+if __name__ == "__main__":
+    compare(True)
+    compare(False)

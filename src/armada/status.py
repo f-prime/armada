@@ -107,14 +107,16 @@ def format_status(snapshot: Fields) -> str:
                   "Free / total: " + " · ".join(
                       f"{name}: {metric('free_' + key)} / {metric('total_' + key)}"
                       for name, key in (("RAM", "ram"), ("disk", "disk"), ("dedicated VRAM", "vram")))])
-    rows = [("NODE", "ADDRESS", "THREADS", "LOAD (1m)", "RAM FREE / TOTAL", "DISK FREE")]
+    rows = [("NODE", "STATUS", "ADDRESS", "THREADS", "LOAD (1m)", "RAM FREE / TOTAL", "DISK FREE")]
     details = []
+    resources = snapshot.get("resources", {})
     for node in nodes:
         label = node[:8]
-        stats = snapshot.get("resources", {}).get(node, {})
+        stats = resources.get(node, {})
+        status = "Unknown" if node not in resources else "Offline" if "error" in stats else "Online"
         endpoint = snapshot.get("peers", {}).get(node, {}).get("endpoint", "")
         rows.append((label + (" (you)" if node == snapshot.get("self") else ""),
-                     endpoint.rsplit(":", 1)[0] or "—",
+                     status, endpoint.rsplit(":", 1)[0] or "—",
                      str(stats.get("cpu_threads") or "—"),
                      f"{stats['cpu_load_1m']:.2f}" if stats.get("cpu_load_1m") is not None else "—",
                      f"{format_size(stats.get('free_ram'))} / {format_size(stats.get('total_ram'))}",

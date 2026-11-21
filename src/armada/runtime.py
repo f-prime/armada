@@ -14,6 +14,8 @@ import struct
 import subprocess
 import sys
 import threading
+from queue import Empty, Queue
+from time import monotonic
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterator, Sequence
 from typing import cast
@@ -58,6 +60,40 @@ from .mesh import (
 from .placement import file_rpc, location, redistribute, verify
 
 ACTIVE: dict[str, int] = {}
+
+
+def _fleet_resources(peers: Sequence[str], timeout: float = 3.0) -> dict[str, Fields]:
+    deadline = monotonic() + timeout
+    pending: Queue[str] = Queue()
+    replies: Queue[tuple[str, Fields]] = Queue()
+    resources: dict[str, Fields] = {peer: {"error": "did not respond in time"} for peer in peers}
+    for peer in peers:
+        pending.put(peer)
+
+    def probe() -> None:
+        while (remaining := deadline - monotonic()) > 0:
+            try:
+                peer = pending.get_nowait()
+            except Empty:
+                return
+            try:
+                report = cast(Fields, rpc(peer, "stats", timeout=remaining))
+            except TimeoutError:
+                report = {"error": "did not respond in time"}
+            except Exception as exc:
+                report = {"error": str(exc)}
+            replies.put((peer, report))
+
+    # DNS and socket reads can outlast a socket timeout; don't hold CLI exit up.
+    for _ in range(min(8, len(peers))):
+        threading.Thread(target=probe, daemon=True).start()
+    for _ in peers:
+        try:
+            peer, report = replies.get(timeout=max(0, deadline - monotonic()))
+        except Empty:
+            break
+        resources[peer] = report
+    return resources
 
 
 def memory_stats() -> tuple[int | None, int | None]:
@@ -342,7 +378,7 @@ def generation(m: Model, prompt: str, count: int, stats: Fields) -> Iterator[int
         f"unavailable layers by owner: {missing}; bring the peer back or use model redistribute",
     )
     owners = m["owners"]
-    ctx = m["qwen"]["ctx"] if m.get("backend") == "qwen3moe" else m["config"][-1]
+    ctx = m["qwen"]["ctx"] if "qwen" in m else m["config"][-1]
     check(0 < count <= ctx, "invalid token count")
     tokens = rpc(owners[0], "tokenize", dict(model=m, prompt=prompt))
     check(0 < len(tokens) < ctx, "prompt is empty or exceeds context window")
@@ -437,7 +473,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_reply(200, self.dispatch("v1/completions", b, s))
                 return
             model = models[b["model"]]
-            check(model.get("backend") == "qwen3moe", "chat requires a Qwen instruction model; use /v1/completions for base models")
+            check(model.get("backend") in ("qwen3", "qwen3moe"), "chat requires a Qwen instruction model; use /v1/completions for base models")
             check(b.get("n", 1) == 1, "only one completion is supported")
             check(isinstance(b.get("stream", False), bool), "stream must be a boolean")
             check(not b.get("stop"), "custom stop sequences are not supported")
@@ -527,7 +563,7 @@ class Handler(BaseHTTPRequestHandler):
             return key_command(b)
         if op == "stats":
             return stats()
-        if op == "qwen-ready":
+        if op in ("qwen-ready", "qwen3-ready"):
             try:
                 import gguf
                 import regex
@@ -575,7 +611,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 ACTIVE[uid] = ACTIVE.get(uid, 0) + 1
             try:
-                fn = gg_stage if b["model"].get("backend") == "qwen3moe" else stage
+                fn = gg_stage if "qwen" in b["model"] else stage
                 return fn(b["model"], b["start"], b["end"], b["payload"])
             finally:
                 with LOCK:
@@ -587,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
             return tok.decode_bytes([b["token"]], keep_special=True).hex()
         if op in ("tokenize", "decode"):
             m = b["model"]
-            if m.get("backend") == "qwen3moe":
+            if "qwen" in m:
                 tok = load_tokenizer(
                     home() / "weights" / ident(m["id"]) / "tokenizer.bin"
                 )
@@ -754,10 +790,5 @@ def execute(args: list[str]) -> object:
         return dict(
             **model, verified_artifacts=count, unavailable_layers=missing, storage_bytes_by_peer=storage
         )
-    resources = cat.setdefault("resources", {})
-    for peer in cat["nodes"]:
-        try:
-            resources[peer] = rpc(peer, "stats")
-        except Exception as e:
-            resources[peer] = {"error": str(e)}
+    resources = cat["resources"] = _fleet_resources(cat["nodes"])
     return dict(**cat, peers=s["peers"], self=s["uid"], totals=fleet_totals(resources))

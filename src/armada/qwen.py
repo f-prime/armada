@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import contextlib
 import hashlib
 import json
@@ -90,11 +91,11 @@ def gg_header(f: BinaryIO) -> tuple[Fields, list[Tensor]]:
 
 
 def gg_config(meta: Fields) -> QwenConfig:
-    check(
-        meta.get("general.architecture") == "qwen3moe",
-        "only qwen3moe GGUF is supported",
-    )
-    p = {k[9:]: v for k, v in meta.items() if k.startswith("qwen3moe.")}
+    arch = meta.get("general.architecture")
+    check(arch in ("qwen3", "qwen3moe"), "expected qwen3 or qwen3moe GGUF")
+    moe = arch == "qwen3moe"
+    prefix = f"{arch}."
+    p = {k.removeprefix(prefix): v for k, v in meta.items() if k.startswith(prefix)}
     d, heads = p["embedding_length"], p["attention.head_count"]
     hd = p.get("attention.key_length", d // heads)
     c = QwenConfig(
@@ -103,9 +104,9 @@ def gg_config(meta: Fields) -> QwenConfig:
         hd=hd,
         kv=p["attention.head_count_kv"],
         layers=p["block_count"],
-        experts=p["expert_count"],
-        top=p["expert_used_count"],
-        hidden=p["expert_feed_forward_length"],
+        experts=p["expert_count"] if moe else 0,
+        top=p["expert_used_count"] if moe else 0,
+        hidden=p["expert_feed_forward_length" if moe else "feed_forward_length"],
         ctx=p["context_length"],
         eps=p["attention.layer_norm_rms_epsilon"],
         theta=p.get("rope.freq_base", 10000.0),
@@ -115,7 +116,7 @@ def gg_config(meta: Fields) -> QwenConfig:
     check(
         hd % 2 == 0
         and heads % c["kv"] == 0
-        and 0 < c["top"] <= c["experts"]
+        and (not moe or 0 < c["top"] <= c["experts"])
         and p.get("attention.value_length", hd) == hd
         and p.get("rope.dimension_count", hd) == hd
         and p.get("rope.scaling.type", "none") == "none"
@@ -139,6 +140,11 @@ def gg_shapes(c: QwenConfig) -> Iterator[tuple[str, list[int], int]]:
     yield "token_embd.weight", [v, d], 0
     yield "output_norm.weight", [d], c["layers"] - 1
     yield "output.weight", [v, d], c["layers"] - 1
+    ffn = (
+        dict(ffn_gate_inp=[e, d], ffn_gate_exps=[e, h, d],
+             ffn_up_exps=[e, h, d], ffn_down_exps=[e, d, h])
+        if e else dict(ffn_gate=[h, d], ffn_up=[h, d], ffn_down=[d, h])
+    )
     for i in range(c["layers"]):
         for key, shape in dict(
             attn_norm=[d],
@@ -149,10 +155,7 @@ def gg_shapes(c: QwenConfig) -> Iterator[tuple[str, list[int], int]]:
             attn_k_norm=[hd],
             attn_output=[d, heads * hd],
             ffn_norm=[d],
-            ffn_gate_inp=[e, d],
-            ffn_gate_exps=[e, h, d],
-            ffn_up_exps=[e, h, d],
-            ffn_down_exps=[e, d, h],
+            **ffn,
         ).items():
             yield f"blk.{i}.{key}.weight", shape, i
 
@@ -196,7 +199,7 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
                     c = gg_config(meta)
                     nodes = online(exclude_self)[: c["layers"]]
                     for node in nodes:
-                        rpc(node, "qwen-ready")
+                        rpc(node, "qwen3-ready" if not c["experts"] else "qwen-ready")
                     owners = [
                         nodes[i * len(nodes) // c["layers"]] for i in range(c["layers"])
                     ]
@@ -217,7 +220,7 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
                     ]
                     m = Model(
                         id=uid,
-                        backend="qwen3moe",
+                        backend=meta["general.architecture"],
                         qwen=c,
                         owners=owners,
                         stop=stops,
@@ -239,6 +242,8 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
                         f"unexpected, duplicate or misshaped tensor: {name_}",
                     )
                     seen.add(name_)
+                    if name_ == "token_embd.weight":
+                        embedding_size = size
                     needs[expected[name_][1]] += size
                 for node, size in needs.items():
                     check(
@@ -266,9 +271,29 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
                         if progress:
                             progress.advance(len(b))
                     pos = offset + size
+        # An output projection may still appear in a later split. Only infer
+        # tying once all headers are accounted for.
+        if not c["experts"] and "output.weight" not in seen:
+            del expected["output.weight"]
+            c["tied_output"] = True
         check(
             seen == set(expected), f"missing tensors: {sorted(set(expected)-seen)[:5]}"
         )
+        first, last = owners[0], owners[-1]
+        if c.get("tied_output") and first != last:
+            if progress:
+                progress.start("Copying tied output embeddings", embedding_size)
+            check(rpc(last, "stats")["free_disk"] >= embedding_size,
+                  f"{last}: need {embedding_size} free disk bytes for tied output")
+            entry = manifests[first]["token_embd.weight"]
+            key = entry[0]
+            for start in range(0, embedding_size, 8 * 2**20):
+                b = base64.b64decode(str(rpc(first, "read-chunk", dict(id=uid, file=key, offset=start))))
+                check(len(b) == min(8 * 2**20, embedding_size - start), "incomplete embedding chunk")
+                rpc(last, f"chunk/{uid}/{key}/{start}/{hashlib.sha256(b).hexdigest()}", body=b)
+                if progress:
+                    progress.advance(len(b))
+            manifests[last]["token_embd.weight"] = entry
         if progress:
             progress.phase("Finalizing manifests…")
         for node, manifest in manifests.items():
@@ -370,6 +395,11 @@ def gg_stage(
         )
         x = x + mm(a.reshape(seq, -1), pre + "attn_output")
         a = norm(x, pre + "ffn_norm")
+        if not c["experts"]:
+            g = mm(a, pre + "ffn_gate")
+            act = mm(a, pre + "ffn_up") * g / (1 + np.exp(-np.clip(g, -80, 80)))
+            x += mm(act, pre + "ffn_down")
+            continue
         scores = mm(a, pre + "ffn_gate_inp")
         top = np.argsort(-scores, axis=-1, kind="stable")[:, : c["top"]]
         weights = np.take_along_axis(scores, top, axis=1)
@@ -382,6 +412,6 @@ def gg_stage(
             act = up * g / (1 + np.exp(-np.clip(g, -80, 80)))
             x[idx] += weights[idx, slot, None] * mm(act, pre + "ffn_down_exps", expert)
     if end == c["layers"]:
-        logits = mm(norm(x[-1], "output_norm"), "output")
+        logits = mm(norm(x[-1], "output_norm"), "token_embd" if c.get("tied_output") else "output")
         return logits if return_logits else int(logits.argmax())
     return cast(list[list[float]], x.tolist())

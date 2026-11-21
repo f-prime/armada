@@ -70,6 +70,8 @@ def layers(m: Model, k: str, f: Artifact) -> list[int]:
         name = f["tensor"][0]
         if name.startswith("blk."):
             return [int(name.split(".")[1])]
+        if name == "token_embd.weight" and m["qwen"].get("tied_output"):
+            return [0, last]
         return [0 if name == "token_embd.weight" else last]
     if k == "emb":
         return [0, last] if m["config"][5] > 0 else [0]
@@ -101,10 +103,14 @@ def plan(old: Model, nodes: list[str], local: dict[str, set[str]]) -> Model:
     n = len(old["owners"])
     sizes = {node: int(rpc(node, "stats")["free_disk"]) for node in nodes}
     costs = {node: [0] * n for node in nodes}
+    shared = {}
     for key, file in old["files"].items():
+        owned_layers = set(layers(old, key, file))
+        if len(owned_layers) > 1:
+            shared[key] = file["size"]
         for node in nodes:
             if key not in local[node]:
-                for i in set(layers(old, key, file)):
+                for i in owned_layers:
                     costs[node][i] += file["size"]
 
     @lru_cache(None)
@@ -117,14 +123,8 @@ def plan(old: Model, nodes: list[str], local: dict[str, set[str]]) -> Model:
         target = (n - start) / min(n - start, len(nodes) - j)
         for count in sorted(range(n - start + 1), key=lambda c: abs(c - target)):
             need = sum(costs[node][start : start + count])
-            if (
-                start == 0
-                and count == n
-                and n > 1
-                and old.get("config", [0] * 6)[5] > 0
-                and "emb" not in local[node]
-            ):
-                need -= old["files"]["emb"]["size"]
+            if start == 0 and count == n:
+                need -= sum(size for key, size in shared.items() if key not in local[node])
             if need > sizes[node]:
                 continue
             rest = assign(j + 1, start + count)
@@ -157,7 +157,7 @@ def recovery(
     from .bpe import gg_tokenizer
     from .runtime import layout
 
-    if m.get("backend") == "qwen3moe":
+    if "qwen" in m:
         for part, path in enumerate(gg_parts(source)):
             with open_source(path) as f:
                 meta, tensors = gg_header(f)
@@ -287,7 +287,7 @@ def redistribute(
                 raise ValueError(
                     f"cannot recover {len(missing)} files (including {min(missing)}); supply --source / --tokenizer: {exc}"
                 ) from exc
-        if m.get("backend") == "qwen3moe":
+        if "qwen" in m:
             if progress:
                 progress.phase("Finalizing manifests…")
             for p in targets:

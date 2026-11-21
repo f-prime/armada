@@ -82,8 +82,9 @@ def test(
             else:
                 names = {p.name for p in shard.glob("blk_*.bin")}
                 assert names and {int(name.split("_")[1]) for name in names} == layers
-                assert (shard / "token_embd_weight.bin").exists() == (i == 0)
-                assert (shard / "output_weight.bin").exists() == (i == 1)
+                tied = bool(m["qwen"].get("tied_output"))
+                assert (shard / "token_embd_weight.bin").exists() == (i == 0 or tied)
+                assert (shard / "output_weight.bin").exists() == (i == 1 and not tied)
         stop0()
         stop1()
         if inspect_shards:

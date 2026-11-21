@@ -12,6 +12,7 @@ type Fields = dict[str, Any]
 
 
 class QwenConfig(TypedDict):
+    tied_output: NotRequired[bool]
     dim: int
     heads: int
     hd: int

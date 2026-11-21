@@ -10,7 +10,7 @@ faster generation.
 macOS has native RAM and GPU reporting; a physical mixed Linux/Mac inference
 benchmark is not yet published. GPU detection is for inventory, not execution.
 The NumPy backend supports legacy `llama2.c` completions and a subset of
-`qwen3moe` GGUF v3 checkpoints with Qwen byte-level BPE. The chat API targets
+`qwen3` and `qwen3moe` GGUF v3 checkpoints with Qwen byte-level BPE. The chat API targets
 Qwen ChatML instruction models; arbitrary GGUF architectures and chat templates
 are not supported.
 
@@ -187,6 +187,22 @@ inference RAM for a particular context length. Finish active requests before
 redistributing; run one placement operation per model at a time. Catalog sync is
 eventual, not a distributed transaction.
 
+### Import dense Qwen3 GGUF
+
+Update Armada and restart the daemon on each peer. Use a direct GGUF file URL
+or local path; the tokenizer is included. For Qwen3-1.7B:
+
+```sh
+repo=https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main
+armada model add "$repo/Qwen3-1.7B-Q8_0.gguf" --name qwen3-small
+armada model status qwen3-small
+armada run qwen3-small 'The capital of France is' -n 8
+```
+
+Use an unscaled-RoPE `qwen3` checkpoint with separate Q/K/V tensors. If the
+output projection is tied, both end peers store the embedding matrix (one copy
+when the same peer owns both ends).
+
 ### Import Qwen3-Coder GGUF
 
 Pass a local GGUF path or HTTPS URL without `--tokenizer`. For numbered splits,
@@ -223,7 +239,10 @@ Placement divides layers by count across enrolled nodes and checks free disk;
 it does not yet optimize for heterogeneous RAM. Input embeddings and the
 output head live on the end stages (tied weights are duplicated if needed).
 `armada status` (also `armada fleet status`) shows a
-per-node summary of RAM, disk, CPU load, GPUs, and active models. Linux peers
+per-node summary of reachability, RAM, disk, CPU load, GPUs, and active models.
+**Online** means the node answered this run's resource check; **Offline** means
+the check failed or timed out. **Unknown** means the snapshot has no check result
+for that node. Linux peers
 discover GPUs through sysfs and enrich NVIDIA data with `nvidia-smi` when
 available. Macs use System Profiler; Apple Silicon reports shared memory rather
 than dedicated VRAM. A dash means the metric was not reported.
