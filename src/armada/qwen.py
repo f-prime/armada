@@ -316,7 +316,8 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
 
 
 def gg_stage(
-    m: Model, start: int, end: int, payload: Payload, return_logits: bool = False
+    m: Model, start: int, end: int, payload: Payload, return_logits: bool = False,
+    *, weights_cache: dict[str, FloatArray] | None = None,
 ) -> FloatArray | int | list[list[float]]:
     import gguf
 
@@ -324,7 +325,7 @@ def gg_stage(
     folder = home() / "weights" / ident(m["id"])
     manifest: dict[str, tuple[str, list[int], int]] = json.loads(
         (folder / "manifest.bin").read_bytes()
-    )
+    ) if weights_cache is None else {}
 
     def rows(
         name: str, expert: int | None = None
@@ -341,6 +342,9 @@ def gg_stage(
         return (data if expert is None else data[expert]), qt
 
     def mm(x: FloatArray, name: str, expert: int | None = None) -> FloatArray:
+        if weights_cache is not None:
+            weight = weights_cache[name + ".weight"]
+            return x @ (weight if expert is None else weight[expert]).T
         data, qt = rows(name, expert)
         # Bound float32 scratch, including for the vocabulary projection.
         out = np.empty((*x.shape[:-1], len(data)), dtype="f4")
@@ -349,16 +353,24 @@ def gg_stage(
         return out
 
     def norm(x: FloatArray, name: str) -> FloatArray:
-        w, qt = rows(name)
+        if weights_cache is None:
+            w, qt = rows(name)
+            scale = gguf.dequantize(w, qt)
+        else:
+            scale = weights_cache[name + ".weight"]
         return np.asarray(
             (x / np.sqrt((x * x).mean(axis=-1, keepdims=True) + c["eps"]))
-            * gguf.dequantize(w, qt),
+            * scale,
             dtype=np.float32,
         )
 
     if start == 0:
-        emb, qt = rows("token_embd")
-        x = gguf.dequantize(emb[np.asarray(payload, dtype=np.intp)], qt)
+        idx = np.asarray(payload, dtype=np.intp)
+        if weights_cache is None:
+            emb, qt = rows("token_embd")
+            x = gguf.dequantize(emb[idx], qt)
+        else:
+            x = weights_cache["token_embd.weight"][idx]
     else:
         x = np.asarray(payload, dtype="f4")
     hd, heads, kv = c["hd"], c["heads"], c["kv"]

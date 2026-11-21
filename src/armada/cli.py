@@ -78,6 +78,11 @@ def main() -> int:
     inventory = model.add_parser("list", help="list models registered in the fleet")
     inventory.add_argument("--json", action="store_true", help="print the inventory as JSON")
     inventory.set_defaults(op="model-list", keys=[])
+    for action, help_text in (("warm", "prepare and keep local shards in RAM on all owners"),
+                              ("cold", "release prepared weights on all owners")):
+        command = model.add_parser(action, help=help_text)
+        command.add_argument("name")
+        command.set_defaults(op="model-" + action, keys=["name"])
     delete = model.add_parser("delete", help="delete a model and its shards across the fleet")
     delete.add_argument("name")
     delete.add_argument("--json", action="store_true", help="print the cleanup report as JSON")

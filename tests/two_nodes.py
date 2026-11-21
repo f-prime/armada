@@ -94,6 +94,25 @@ def test(
         args = ("run", "tiny", "Once upon a time", "-n", "16")
         expected = cmd(2, *args)
         stop0, stop1 = start(0), start(1)
+        cmd(1, "model", "warm", "tiny")
+        status = json.loads(cmd(0, "model", "status", "tiny", "--json"))
+        assert status["warmth"] == "warm" and status["warmth_by_owner"] == dict.fromkeys(ids, "warm")
+        # A warm generation must actually use prepared tensors on both owners.
+        with ExitStack() as restore:
+            for i in (0, 1):
+                folder = root / str(i) / "weights" / m["id"]
+                for p in folder.glob("*.bin"):
+                    if p.stem != "tokenizer":
+                        restore.callback(p.rename(p.with_suffix(".held")).rename, p)
+            assert cmd(0, *args) == expected
+        stop1()
+        offline = json.loads(cmd(0, "model", "status", "tiny", "--json"))
+        assert offline["warmth_by_owner"][ids[1]] == "unknown"
+        stop1 = start(1)
+        assert json.loads(cmd(0, "model", "status", "tiny", "--json"))["warmth"] == "partially warm"
+        cmd(0, "model", "cold", "tiny")
+        assert json.loads(cmd(1, "model", "status", "tiny", "--json"))["warmth"] == "cold"
+        assert cmd(1, *args) == expected
         stop3 = start(3)
         # Third peer drives import but stores no weights.
         cmd(0, "fleet", "add", addresses[3], stdin=cmd(3, "fleet", "pairing-code") + "\n")

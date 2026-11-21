@@ -57,9 +57,11 @@ from .mesh import (
     snapshot,
     unavailable,
 )
-from .placement import file_rpc, location, redistribute, verify
+from .placement import destinations, file_rpc, location, redistribute, verify
+from .residency import Weights, resident
 
 ACTIVE: dict[str, int] = {}
+PREPARE = threading.Lock()
 
 
 def _fleet_resources(peers: Sequence[str], timeout: float = 3.0) -> dict[str, Fields]:
@@ -127,6 +129,7 @@ def stats() -> Fields:
     gpus = gpu_stats()
     with LOCK:
         active = list(ACTIVE)
+        warm = list(resident)
     return dict(
         free_ram=free_ram,
         total_ram=total_ram,
@@ -142,7 +145,8 @@ def stats() -> Fields:
             for p in home().glob("weights/*")
         },
         active_models=active,
-        load_policy="mapped per stage request",
+        warm_models=warm,
+        load_policy="mapped per stage request unless explicitly warmed",
     )
 
 
@@ -168,6 +172,44 @@ def layout(c: Sequence[int]) -> Iterator[tuple[str, tuple[int, ...], int | None]
     yield "rope_i", (ctx, d // heads // 2), None
     if vocab < 0:
         yield "out", (-vocab, d), n
+
+
+def prepare_weights(m: Model, node: str) -> Weights:
+    """Expand this owner's verified tensor inventory to independent float32 arrays."""
+    import math
+
+    folder = home() / "weights" / ident(m["id"])
+    local = {k: f for k, f in m["files"].items()
+             if k != "tokenizer" and node in destinations(m, k, f)}
+    legacy = {k: dims for k, dims, _ in layout(m["config"])} if "config" in m else {}
+    shapes = {k: tuple(f["tensor"][1]) if "tensor" in f else legacy[k] for k, f in local.items()}
+    needed = sum(4 * math.prod(shape) for shape in shapes.values())
+    available, _ = memory_stats()
+    check(available is None or available > needed, f"need {needed} available RAM bytes")
+    weights: Weights = {}
+    for key, artifact in local.items():
+        path = folder / (ident(key) + ".bin")
+        shape = shapes[key]
+        check(path.stat().st_size == artifact["size"], f"incomplete shard: {key}")
+        if "tensor" in artifact:
+            import gguf
+
+            name, _, code = artifact["tensor"]
+            qt = gguf.GGMLQuantizationType(code)
+            block, size = gguf.GGML_QUANT_SIZES[qt]
+            raw = np.memmap(path, dtype="u1", mode="r").reshape(-1, shape[-1] // block * size)
+            data = np.empty(shape, dtype="f4")
+            rows = data.reshape(-1, shape[-1])
+            for j in range(0, len(rows), 256):
+                rows[j:j+256] = gguf.dequantize(raw[j:j+256], qt)
+            weights[name] = data
+        elif len(shape) == 1:
+            weights[key] = np.fromfile(path, dtype="<f4").reshape(shape)
+        else:
+            scales = np.memmap(path, dtype="<f4", mode="r", shape=(shape[0], 1))
+            quantized = np.memmap(path, dtype="i1", mode="r", offset=4 * shape[0], shape=shape)
+            weights[key] = np.asarray(quantized * scales, dtype=np.float32)
+    return weights
 
 
 def import_model(
@@ -293,7 +335,7 @@ def encode(prompt: str, pieces: list[bytes], scores: list[float]) -> list[int]:
     return tokens
 
 
-def stage(m: Model, start: int, end: int, payload: Payload) -> int | list[list[float]]:
+def stage(m: Model, start: int, end: int, payload: Payload, *, weights: Weights | None = None) -> int | list[list[float]]:
     """Evaluate one contiguous decoder stage, recomputing the prefix (no KV cache)."""
     d, h, n, heads, kv, vocab, ctx = m["config"]
     folder = home() / "weights" / ident(m["id"])
@@ -302,6 +344,8 @@ def stage(m: Model, start: int, end: int, payload: Payload) -> int | list[list[f
     def matrix(
         key: str, rows: int, cols: int, index: Payload | None = None
     ) -> FloatArray:
+        if weights is not None:
+            return weights[key] if index is None else weights[key][np.asarray(index, dtype=np.intp)]
         path = folder / (key + ".bin")
         scale = np.memmap(path, dtype="<f4", mode="r", shape=(rows, 1))
         q = np.memmap(path, dtype="i1", mode="r", offset=4 * rows, shape=(rows, cols))
@@ -314,7 +358,7 @@ def stage(m: Model, start: int, end: int, payload: Payload) -> int | list[list[f
         return np.asarray(
             x
             / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + 1e-5)
-            * np.fromfile(folder / (key + ".bin"), "<f4"),
+            * (weights[key] if weights is not None else np.fromfile(folder / (key + ".bin"), "<f4")),
             dtype=np.float32,
         )
 
@@ -610,15 +654,38 @@ class Handler(BaseHTTPRequestHandler):
                 save(home() / "node.json", s)
                 return s["pair"]
         if op == "discard":
-            shutil.rmtree(home() / "weights" / ident(b["id"]), ignore_errors=True)
+            with LOCK:
+                resident.pop(b["id"], None)
+                shutil.rmtree(home() / "weights" / ident(b["id"]), ignore_errors=True)
+            return True
+        if op in ("model-warm", "model-cold"):
+            uid = b["id"]
+            with PREPARE:
+                with LOCK:
+                    m = state()["models"].get(b["name"])
+                    check(m is not None and m["id"] == uid and s["uid"] in m["owners"],
+                          "model placement changed")
+                    assert m is not None
+                    if op == "model-cold":
+                        resident.pop(uid, None)
+                        return True
+                    if uid in resident:
+                        return True
+                prepared = prepare_weights(m, s["uid"])
+                with LOCK:
+                    latest = state()["models"].get(b["name"])
+                    check(latest is not None and latest["id"] == uid, "model placement changed")
+                    resident[uid] = prepared
             return True
         if op == "stage":
             uid = b["model"]["id"]
             with LOCK:
                 ACTIVE[uid] = ACTIVE.get(uid, 0) + 1
+                cached = resident.get(uid)
             try:
-                fn = gg_stage if "qwen" in b["model"] else stage
-                return fn(b["model"], b["start"], b["end"], b["payload"])
+                if "qwen" in b["model"]:
+                    return gg_stage(b["model"], b["start"], b["end"], b["payload"], weights_cache=cached)
+                return stage(b["model"], b["start"], b["end"], b["payload"], weights=cached)
             finally:
                 with LOCK:
                     ACTIVE[uid] -= 1
@@ -765,6 +832,22 @@ def execute(args: list[str]) -> object:
             dict(model=a[0], prompt=a[1], max_tokens=int(a[2])),
         )["choices"][0]["text"]
     cat = catalog(s)
+    if op in ("model-warm", "model-cold"):
+        check(a[0] in cat["models"], f"unknown model: {a[0]}")
+        target = cat["models"][a[0]]
+        owners = list(dict.fromkeys(target["owners"]))
+
+        def apply(peer: str) -> str:
+            try:
+                check(rpc(peer, op, dict(name=a[0], id=target["id"])) is True, "no confirmation")
+                return ""
+            except Exception as exc:
+                return f"{peer}: {exc}"
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            failures = list(filter(None, pool.map(apply, owners)))
+        check(not failures, "; ".join(failures))
+        return f"{a[0]}: {op.removeprefix('model-')} on all {len(owners)} owners"
     if op == "model-delete":
         check(a[0] in cat["models"], f"unknown model: {a[0]}")
         return rpc(s["addr"], op, dict(name=a[0], id=cat["models"][a[0]]["id"]))
@@ -779,22 +862,30 @@ def execute(args: list[str]) -> object:
         missing = unavailable(model)
         peers = list(dict.fromkeys([*model["owners"], *cat["nodes"]]))
 
-        def stored(peer: str) -> int | None:
+        def probe_owner(peer: str) -> tuple[int | None, str]:
             if peer not in missing:
                 try:
                     report = rpc(peer, "stats", timeout=12)
                     if isinstance(report, dict) and isinstance(report.get("shards"), dict):
                         size = report["shards"].get(model["id"], 0)
                         if type(size) is int and size >= 0:
-                            return size
+                            warm = report.get("warm_models")
+                            return size, ("unknown" if not isinstance(warm, list) else
+                                          "warm" if model["id"] in warm else "cold")
                 except (OSError, ValueError):
                     pass
-            return None
+            return None, "unknown"
 
         with ThreadPoolExecutor(max_workers=8) as pool:
-            storage = dict(zip(peers, pool.map(stored, peers)))
+            reports = dict(zip(peers, pool.map(probe_owner, peers)))
+        storage = {p: v[0] for p, v in reports.items()}
+        residency = {p: reports[p][1] for p in dict.fromkeys(model["owners"])}
+        states = set(residency.values())
+        warmth = ("unknown" if "unknown" in states else "partially warm" if len(states) > 1
+                  else next(iter(states)))
         return dict(
-            **model, verified_artifacts=count, unavailable_layers=missing, storage_bytes_by_peer=storage
+            **model, verified_artifacts=count, unavailable_layers=missing, storage_bytes_by_peer=storage,
+            warmth=warmth, warmth_by_owner=residency,
         )
     resources = cat["resources"] = _fleet_resources(cat["nodes"])
     return dict(**cat, peers=s["peers"], self=s["uid"], totals=fleet_totals(resources))

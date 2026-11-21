@@ -28,6 +28,9 @@ def format_model_status(name: str, model: Fields) -> str:
                if unknown else f"{total} total")
     lines = [f"Model: {name} · {layers} layer{'s' if layers != 1 else ''} across "
              f"{peers} peer{'s' if peers != 1 else ''}", f"Status: {status}", f"Storage: {summary}", ""]
+    warmth = model.get("warmth_by_owner", {})
+    ready = sum(value == "warm" for value in warmth.values())
+    lines.insert(-1, f"Memory: {model.get('warmth', 'unknown')} ({ready}/{peers} owners ready)")
     spans: dict[str, list[str]] = {}
     start = 0
     for owner, group in groupby(owners):
@@ -35,12 +38,13 @@ def format_model_status(name: str, model: Fields) -> str:
         span = str(start) if end == start + 1 else f"{start}–{end - 1}"
         spans.setdefault(owner, []).append(span)
         start = end
-    rows = [("PEER", "LAYERS", "STORED", "STATUS")]
+    rows = [("PEER", "LAYERS", "STORED", "STATUS", "MEMORY")]
     for peer, size in storage.items():
         reach = ("Unreachable" if peer in missing else "Reachable"
                  if peer in spans or size is not None else "Unreported")
         rows.append((peer[:8], ", ".join(spans.get(peer, [])) or "—",
-                     "Unknown" if size is None else format_size(size), reach))
+                     "Unknown" if size is None else format_size(size), reach,
+                     warmth.get(peer, "unknown") if peer in spans else "—"))
     widths = [max(map(len, column)) for column in zip(*rows)]
     lines.extend("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in rows)
     return "\n".join(lines)

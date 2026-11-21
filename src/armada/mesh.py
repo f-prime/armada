@@ -11,6 +11,8 @@ from .common import address, check, home, ident, rpc, save, state
 from .schema import Fields, Model, NodeState, Peer
 from .keys import merge_keys, metadata, mutate
 
+from .residency import resident
+
 LOCK = threading.RLock()
 
 
@@ -99,6 +101,7 @@ def merge_models(s: NodeState, data: Fields) -> bool:
 def clean_deleted(s: NodeState) -> list[str]:
     pending = []
     for uid in s.get("deleted_models", []):
+        resident.pop(uid, None)
         try:
             shutil.rmtree(home() / "weights" / ident(uid))
         except FileNotFoundError:
@@ -130,6 +133,7 @@ def merge(data: Fields) -> list[str]:
         for m in s["models"].values():
             for uid in m.get("retired", []):
                 if uid not in live:
+                    resident.pop(uid, None)
                     shutil.rmtree(home() / "weights" / ident(uid), ignore_errors=True)
         return clean_deleted(s)
 
@@ -176,6 +180,7 @@ def detach(s: NodeState) -> None:
     if weights.exists():
         weights.rename(home() / ("weights-left-" + uid))
     save(home() / "node.json", fresh)
+    resident.clear()
 
 
 def remove_peer(selector: str) -> str:

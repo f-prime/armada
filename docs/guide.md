@@ -137,6 +137,16 @@ bytes reported for that model; `Unknown` means no measurement. The summary
 labels partial totals. Add `--json` for exact `storage_bytes_by_peer` values
 keyed by full node ID, with `null` for unknown sizes.
 
+Use `armada model warm NAME` before the first prompt to load each owner's
+weights into RAM. Each daemon keeps its own shard as prepared float32 weights
+(four bytes per parameter), which can require much more RAM than the stored
+files. Subsequent `armada run` and API requests reuse those weights.
+`armada model cold NAME` releases them without deleting the model.
+`armada model status NAME` reports memory state per owner and for the model;
+unreachable or older owners report `unknown`. If a command fails on one owner,
+successful owners keep their new state; retry the command to finish.
+Warmth lasts until released, the daemon restarts, or the placement is replaced.
+
 `armada model delete NAME` removes the model from the fleet catalog and deletes
 its Armada shard directories. The source checkpoint is untouched. Use `--json`
 for the model ID and lists of confirmed and pending peers. Offline peers clean
