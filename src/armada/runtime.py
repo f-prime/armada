@@ -460,6 +460,9 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
         totals = dict.fromkeys(spans, 0.0)
         compute = dict.fromkeys(spans, 0.0)
         measured: dict[str, int] = {}
+        setup_ms = 0.0
+        prefill: dict[str, float] = {}
+        prefill_compute: dict[str, float] = {}
         for step in range(min(count, ctx - prompt_len)):
             offset = prompt_len + step - 1 if step else 0
             payload: Payload | int = tokens[-1:] if step else tokens
@@ -467,6 +470,8 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
             kernel: dict[str, float] = {}
             for node, start, end in stages:
                 before = monotonic() if diagnostics else 0.0
+                if diagnostics and step == 0 and start == 0:
+                    setup_ms = 1000 * (before - started)
                 touched.add(node)
                 try:
                     body = dict(model=m, start=start, end=end, payload=payload,
@@ -490,6 +495,8 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
             if not isinstance(payload, int):
                 raise ValueError("final stage did not return a token ID")
             sampled += 1
+            if diagnostics and step == 0:
+                prefill, prefill_compute = elapsed, kernel
             if payload in m.get("stop", (1, 2)):
                 reason = "stop"
                 break
@@ -506,9 +513,12 @@ def generation(m: Model, prompt: str, count: int, stats: Fields, *, diagnostics:
             yield payload
         if diagnostics:
             stats["diagnostics"] = dict(
+                prompt_tokens=prompt_len, setup_ms=setup_ms,
                 first_ms=(first-started)*1000 if emitted else None,
                 tokens_per_second=(emitted-1)/(last-first) if emitted > 1 and last > first else None,
-                 owners=[dict(owner=node, layers=", ".join(ranges),
+                  owners=[dict(owner=node, layers=", ".join(ranges),
+                               prefill_ms=1000*prefill[node],
+                               prefill_compute_ms=1000*prefill_compute[node] if node in prefill_compute else None,
                               compute_ms=1000*compute[node]/(emitted-1) if emitted > 1 and node in measured else None,
                               threads=measured.get(node),
                              avg_ms=1000*totals[node]/(emitted-1) if emitted > 1 else None)

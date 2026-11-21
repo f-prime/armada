@@ -1,5 +1,6 @@
 """Human-readable fleet snapshot (including snapshots from older peers)."""
 
+from collections.abc import Sequence
 from itertools import groupby
 
 from .schema import Fields, Peer
@@ -12,6 +13,21 @@ def format_timings(report: Fields, peers: dict[str, Peer]) -> str:
     rate = report["tokens_per_second"]
     speed = "n/a" if rate is None else f"{rate:.2f} tokens/s"
     lines = [f"First token: {ms(report['first_ms'])} · Generation after first token: {speed}"]
+    def table(rows: Sequence[tuple[str, ...]]) -> None:
+        widths = [max(map(len, column)) for column in zip(*rows)]
+        lines.extend("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in rows)
+
+    if "prompt_tokens" in report:
+        lines.append(f"Prompt: {report['prompt_tokens']} tokens · Setup before first stage: {ms(report['setup_ms'])}")
+        prefill = [("OWNER", "LAYERS", "PREFILL ROUND TRIP", "WORKER", "RPC OVERHEAD")]
+        for row in report["owners"]:
+            owner = row["owner"]
+            label = peers[owner]["endpoint"] if owner in peers else owner
+            worker = row["prefill_compute_ms"]
+            overhead = max(0.0, row["prefill_ms"] - worker) if worker is not None else None
+            prefill.append((label, row["layers"], ms(row["prefill_ms"]), ms(worker), ms(overhead)))
+        table(prefill)
+        lines.append("")
     rows = [("OWNER", "LAYERS", "AVG ROUND TRIP / TOKEN AFTER FIRST", "WORKER", "RPC OVERHEAD", "Q8 THREADS")]
     for row in report["owners"]:
         owner = row["owner"]
@@ -20,8 +36,7 @@ def format_timings(report: Fields, peers: dict[str, Peer]) -> str:
         overhead = max(0.0, row["avg_ms"] - compute) if compute is not None else None
         rows.append((label, row["layers"], ms(row["avg_ms"]), ms(compute), ms(overhead),
                      str(row["threads"]) if row.get("threads") is not None else "n/a"))
-    widths = [max(map(len, column)) for column in zip(*rows)]
-    lines.extend("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in rows)
+    table(rows)
     return "\n".join(lines)
 
 

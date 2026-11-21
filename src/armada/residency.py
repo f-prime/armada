@@ -19,6 +19,7 @@ except ImportError:
     matvec = None  # type: ignore[assignment]
 
 NATIVE_Q8 = matvec is not None and os.getenv("ARMADA_NATIVE_Q8", "1") != "0"
+_PREFILL_LIMIT = 32 if os.getenv("ARMADA_Q8_PREFILL", "1") != "0" else 1
 MAX_THREADS = 32
 _cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
 DEFAULT_THREADS = int(os.getenv("ARMADA_Q8_THREADS", str(min(4, _cpus))))
@@ -61,26 +62,27 @@ class PackedTensor:
 
     def multiply(self, x: FloatArray, expert: int | None = None) -> FloatArray:
         rows, cols = self.shape[-2:]
-        out = np.empty((*x.shape[:-1], rows), dtype="f4")
-        if (NATIVE_Q8 and matvec is not None and x.size == cols
+        batch = x.size // cols
+        if (NATIVE_Q8 and matvec is not None and 1 <= batch <= _PREFILL_LIMIT
                 and self.qt == gguf.GGMLQuantizationType.Q8_0):
             packed = self.data if expert is None else self.data[expert]
             vector = np.require(x, dtype=np.float32, requirements=["C", "A"])
+            result = np.empty((rows, batch), dtype="f4")
             workers = min(q8_threads.get(), rows, max(1, packed.nbytes // (512 * 1024)))
             if workers == 1:
-                matvec(packed, vector, out)
+                matvec(packed, vector, result, batch)
             else:
-                result = out.reshape(-1)
                 jobs = []
                 for i in range(workers):
                     span = slice(i * rows // workers, (i + 1) * rows // workers)
                     if i + 1 == workers:
-                        matvec(packed[span], vector, result[span])
+                        matvec(packed[span], vector, result[span], batch)
                     else:
-                        jobs.append(_pool.submit(matvec, packed[span], vector, result[span]))
+                        jobs.append(_pool.submit(matvec, packed[span], vector, result[span], batch))
                 for job in jobs:
                     job.result()
-            return out
+            return result.T.reshape(*x.shape[:-1], rows)
+        out = np.empty((*x.shape[:-1], rows), dtype="f4")
         # Target at most 4 MiB of decoded weights (or one very wide row).
         step = max(1, min(256, 2**20 // cols))
         for j in range(0, rows, step):

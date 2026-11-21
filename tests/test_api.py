@@ -31,7 +31,10 @@ class InferenceTest(unittest.TestCase):
             if op == "stage-kv":
                 if node == "a":
                     self.assertEqual(len(body["payload"]), 1)
-                    return [[body["offset"]]]
+                    hidden = [[body["offset"]]]
+                    if body.get("profile"):
+                        return dict(payload=hidden, compute_s=0.75 if not body["offset"] else 0.25, q8_threads=4)
+                    return hidden
                 i = body["payload"][0][0]
                 if i == 1 and self.resume is not None:
                     self.assertTrue(self.resume.wait(timeout=5), "client buffered the first token")
@@ -100,6 +103,9 @@ class InferenceTest(unittest.TestCase):
                         text = response["choices"][0]["text"]
                     self.assertEqual(text.encode(), output)
                     self.assertEqual(report["first_ms"], 5000 if output else None)
+                    self.assertEqual((report["prompt_tokens"], report["setup_ms"]), (1, 1000))
+                    self.assertEqual([(r["prefill_ms"], r["prefill_compute_ms"]) for r in report["owners"]],
+                                     [(1000, 750), (1000, None)])
                     self.assertEqual(report["tokens_per_second"], 0.2 if len(output) == 2 else None)
                     self.assertEqual([(r["owner"], r["layers"]) for r in report["owners"]],
                                      [("a", "0"), ("b", "1")])

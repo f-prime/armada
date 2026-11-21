@@ -22,6 +22,12 @@ class PackedMatvecTest(unittest.TestCase):
             reference = tensor.multiply(x, 1)
             residency.q8_threads.set(4)
             np.testing.assert_array_equal(tensor.multiply(x, 1), reference)
+            prompt = rng.normal(size=(23, shape[-1])).astype("f4")
+            expected = np.stack([tensor.multiply(token, 1) for token in prompt])
+            with patch.object(residency, "_PREFILL_LIMIT", 32), patch.object(
+                PackedTensor, "decode", side_effect=AssertionError("decoded a prompt weight tile")
+            ):
+                np.testing.assert_array_equal(tensor.multiply(prompt, 1), expected)
         finally:
             residency.q8_threads.reset(ticket)
 

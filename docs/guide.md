@@ -286,15 +286,24 @@ the prior context. Update and restart all layer owners before using an updated
 coordinator; no model reimport is needed. For slow runs set `ARMADA_RPC_TIMEOUT` (seconds,
 default 300) on the CLI and daemons.
 
-Q8_0 single-token decode uses an optional native CPU kernel (AVX2 on
+Short Q8_0 prompt batches and single-token decode use an optional native CPU kernel (AVX2 on
 supported x86 machines, NEON on Apple Silicon, otherwise scalar C). It reads
-packed weights directly. Prompt batches and other quantizations still use the
+packed weights directly. A prompt batch of up to 32 positions reuses each
+packed weight row across its tokens and still makes one RPC per stage.
+Set `ARMADA_Q8_PREFILL=0` before daemon startup to compare with the NumPy
+prefill path while retaining native single-token decode. Larger batches and other quantizations use the
 NumPy path. Reinstall Armada from the checkout and restart each daemon to
 pick up the extension. If no C compiler is available, inference falls back to
 NumPy. From a `uv` checkout, check with
 `uv run python -c 'from armada.residency import NATIVE_Q8; print(NATIVE_Q8)'`.
 For a comparison, set `ARMADA_NATIVE_Q8=0` in the worker environment before
 starting the daemon, then measure `armada run ... -v` with the same prompt.
+
+To diagnose a short prompt on its first layer owner without changing the live
+daemon, run `uv run python tools/bench_prefill.py NAME 'YOUR PROMPT'`. This
+loads a separate warm copy of the local shard (allow enough RAM) and compares
+the inherited BLAS configuration, one OpenBLAS thread, one native token at a
+time, and the native packed batch. It checks stage outputs against the reference.
 
 `armada model warm NAME` automatically tunes Q8_0 decode threads on each
 owner in parallel. On the first warm it times single-token passes over the
@@ -316,7 +325,10 @@ uv run python tools/bench_decode.py ablit --counts 1 2 4 8
 
 Counts follow distinct owners in layer order; a single count applies to all.
 `-v` separates time inside each worker stage from remaining RPC overhead
-(including serialization and scheduling). The benchmark uses the non-streaming
+(including serialization and scheduling). The first table reports the prompt
+token count, setup time (including reachability checks and tokenization), and
+each owner's prompt-processing (prefill) round trip. The second table covers
+only tokens after the first. The benchmark uses the non-streaming
 completion API, repeats each setting three times, checks for identical text,
 and tries the best per-owner combination before reporting fleet-wide median
 decode throughput. Restart updated daemons and warm the model once before testing.
