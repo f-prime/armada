@@ -59,11 +59,11 @@ subset of dense Llama 3 (`llama` with `llama-bpe` and unscaled RoPE), `qwen3`, t
 and `qwen3moe` GGUF v3 checkpoints. Chat requires a supported Qwen ChatML
 instruction model. Inference is CPU-only and integration-tested on Linux.
 
-**CPU performance:** Q8_0 has a native, multithreaded kernel for short
+**CPU performance:** Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 use native multithreaded kernels for short
 prompt batches (up to 32 positions per matrix multiply) and single-token
 decoding when the extension is installed. `armada model warm NAME` automatically
 tunes its thread count on each worker. Larger batches and other
-supported quantizations (Q4_0, Q4_1, Q5_0, Q5_1, and Q2_K through Q6_K) use
+supported quantizations (Q5_0, Q5_1, Q2_K, and Q3_K) use
 NumPy. For mixed GGUFs, the fast path applies per tensor, not per filename.
 
 **Benchmarking:** Warm each model, then run `armada run NAME 'PROMPT' -n 64 -v`

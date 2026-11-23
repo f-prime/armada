@@ -1,4 +1,4 @@
-"""Node-local Q8 decode calibration. Placement generations have immutable shard files."""
+"""Node-local packed decode calibration. Placement generations have immutable shard files."""
 import hashlib
 import json
 import os
@@ -8,8 +8,6 @@ from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
-
-import gguf
 
 from . import residency
 from .common import home, ident, save
@@ -31,7 +29,8 @@ def _kernel() -> str:
 def _environment() -> tuple[str, int]:
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
     cpus = len(affinity) if affinity else os.cpu_count() or 1
-    key = json.dumps([1, platform.machine(), platform.node(), _kernel(), cpus, affinity])
+    key = json.dumps([2, platform.machine(), platform.node(), _kernel(), cpus, affinity,
+                      residency.NATIVE_Q8, residency.NATIVE_LOWBIT])
     return key, min(MAX_THREADS, cpus)
 
 
@@ -53,17 +52,17 @@ def _read(path: Path, signature: str) -> int | None:
 
 
 def selected(uid: str) -> int:
-    if not residency.NATIVE_Q8 or "ARMADA_Q8_THREADS" in os.environ:
+    if not (residency.NATIVE_Q8 or residency.NATIVE_LOWBIT) or "ARMADA_Q8_THREADS" in os.environ:
         return DEFAULT_THREADS
     return _read(_path(uid), _environment()[0]) or DEFAULT_THREADS
 
 
 def calibrate(uid: str, weights: Weights, decode: Callable[[], None]) -> None:
-    if not residency.NATIVE_Q8 or "ARMADA_Q8_THREADS" in os.environ:
+    if not (residency.NATIVE_Q8 or residency.NATIVE_LOWBIT) or "ARMADA_Q8_THREADS" in os.environ:
         return
     # Single-expert bytes matter, not the combined size of all experts.
-    if not any(t.qt == gguf.GGMLQuantizationType.Q8_0 and len(t.shape) in (2, 3)
-               and t.shape[-1] // 32 * 34 * t.shape[-2] >= 1024**2 for t in weights.values()):
+    if not any(residency.native_type(t.qt) and len(t.shape) in (2, 3)
+               and t.data.nbytes // (t.shape[0] if len(t.shape) == 3 else 1) >= 1024**2 for t in weights.values()):
         return
     signature, limit = _environment()
     path = _path(uid)

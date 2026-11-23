@@ -60,7 +60,7 @@ from .mesh import (
     unavailable,
 )
 from .placement import destinations, file_rpc, location, redistribute, verify
-from .residency import MAX_THREADS, NATIVE_Q8, PackedTensor, Weights, q8_threads, resident
+from .residency import MAX_THREADS, NATIVE_LOWBIT, NATIVE_Q8, PackedTensor, Weights, q8_threads, resident
 from . import autotune
 
 ACTIVE: dict[str, int] = {}
@@ -821,7 +821,7 @@ class Handler(BaseHTTPRequestHandler):
                         else:
                             result = stage(b["model"], b["start"], b["end"], b["payload"], weights=cached, cache=cache)
                     return dict(payload=result, compute_s=monotonic()-before,
-                                q8_threads=count if NATIVE_Q8 else 0) if timed else result
+                                q8_threads=count if NATIVE_Q8 or NATIVE_LOWBIT else 0) if timed else result
                 finally:
                     q8_threads.reset(ticket)
             finally:

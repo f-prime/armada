@@ -307,7 +307,8 @@ the prior context. Update and restart all layer owners before using an updated
 coordinator; no model reimport is needed. For slow runs set `ARMADA_RPC_TIMEOUT` (seconds,
 default 300) on the CLI and daemons.
 
-Short Q8_0 prompt batches and single-token decode use an optional native CPU kernel (AVX2 on
+Short prompt batches and single-token decode for Q4_0, Q4_1, Q4_K, Q5_K,
+Q6_K, and Q8_0 use optional native CPU kernels (AVX2 on
 supported x86 machines, NEON on Apple Silicon, otherwise scalar C). It reads
 packed weights directly. A prompt batch of up to 32 positions reuses each
 packed weight row across its tokens and still makes one RPC per stage.
@@ -316,8 +317,9 @@ prefill path while retaining native single-token decode. Larger batches and othe
 NumPy path. Reinstall Armada from the checkout and restart each daemon to
 pick up the extension. If no C compiler is available, inference falls back to
 NumPy. From a `uv` checkout, check with
-`uv run python -c 'from armada.residency import NATIVE_Q8; print(NATIVE_Q8)'`.
-For a comparison, set `ARMADA_NATIVE_Q8=0` in the worker environment before
+`uv run python -c 'from armada.residency import NATIVE_LOWBIT, NATIVE_Q8; print(NATIVE_LOWBIT, NATIVE_Q8)'`.
+For a comparison, set `ARMADA_NATIVE_LOWBIT=0` to disable the Q4/Q5_K/Q6_K
+kernels or `ARMADA_NATIVE_Q8=0` to disable Q8_0 in the worker environment before
 starting the daemon, then measure `armada run ... -v` with the same prompt.
 
 To diagnose a short prompt on its first layer owner without changing the live
@@ -326,7 +328,7 @@ loads a separate warm copy of the local shard (allow enough RAM) and compares
 the inherited BLAS configuration, one OpenBLAS thread, one native token at a
 time, and the native packed batch. It checks stage outputs against the reference.
 
-`armada model warm NAME` automatically tunes Q8_0 decode threads on each
+`armada model warm NAME` automatically tunes packed decode threads on each
 owner in parallel. On the first warm it times single-token passes over the
 actual local shard, then saves the fastest median setting beside that shard.
 Later requests (including after a restart) reuse it. A new placement, changed

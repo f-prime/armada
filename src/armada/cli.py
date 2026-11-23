@@ -116,7 +116,7 @@ def main() -> int:
     run.add_argument("name")
     run.add_argument("prompt")
     run.add_argument("-n", "--tokens", type=int, default=32)
-    run.add_argument("--q8-threads", help="Q8 decode threads: one count for all owners, or comma-separated counts in layer order")
+    run.add_argument("--q8-threads", help="native packed decode threads: one count for all owners, or comma-separated counts in layer order")
     run.add_argument("--no-stream", action="store_true", help="print only the completed response")
     run.add_argument("-v", "--verbose", action="store_true", help="report fleet and per-owner timings on stderr")
     run.set_defaults(op="run", keys=["name", "prompt", "tokens"])

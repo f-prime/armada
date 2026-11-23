@@ -28,7 +28,7 @@ def format_timings(report: Fields, peers: dict[str, Peer]) -> str:
             prefill.append((label, row["layers"], ms(row["prefill_ms"]), ms(worker), ms(overhead)))
         table(prefill)
         lines.append("")
-    rows = [("OWNER", "LAYERS", "AVG ROUND TRIP / TOKEN AFTER FIRST", "WORKER", "RPC OVERHEAD", "Q8 THREADS")]
+    rows = [("OWNER", "LAYERS", "AVG ROUND TRIP / TOKEN AFTER FIRST", "WORKER", "RPC OVERHEAD", "NATIVE THREADS")]
     for row in report["owners"]:
         owner = row["owner"]
         label = peers[owner]["endpoint"] if owner in peers else owner

@@ -14,12 +14,12 @@ from armada.residency import DEFAULT_THREADS, PackedTensor, q8_threads
 class DecodeTuningTest(unittest.TestCase):
     def test_persistence_invalidation_and_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ARMADA_HOME=tmp), \
-             patch.object(residency, "NATIVE_Q8", True), \
+             patch.object(residency, "NATIVE_LOWBIT", True), patch.object(residency, "NATIVE_Q8", False), \
              patch.object(autotune, "_environment", return_value=("cpu-A", 4)) as env:
             os.environ.pop("ARMADA_Q8_THREADS", None)
             (Path(tmp) / "weights" / "model").mkdir(parents=True)
-            w = {"w": PackedTensor(np.empty(1024 * 34 * 32, dtype="u1"), (1024, 1024),
-                                   gguf.GGMLQuantizationType.Q8_0)}
+            w = {"w": PackedTensor(np.empty((2048, 4*144), dtype="u1"), (2048, 1024),
+                                   gguf.GGMLQuantizationType.Q4_K)}
             clock = 0.0
             calls = []
 

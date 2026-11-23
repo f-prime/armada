@@ -19,6 +19,19 @@ except ImportError:
     matvec = None  # type: ignore[assignment]
 
 NATIVE_Q8 = matvec is not None and os.getenv("ARMADA_NATIVE_Q8", "1") != "0"
+try:
+    from ._q8 import lowbit_matvec
+except ImportError:
+    lowbit_matvec = None  # type: ignore[assignment]
+
+QT = gguf.GGMLQuantizationType
+LOWBIT_TYPES = {QT.Q4_0, QT.Q4_1, QT.Q4_K, QT.Q5_K, QT.Q6_K}
+NATIVE_LOWBIT = lowbit_matvec is not None and os.getenv("ARMADA_NATIVE_LOWBIT", "1") != "0"
+
+
+def native_type(qt: gguf.GGMLQuantizationType | None) -> bool:
+    return (NATIVE_Q8 and qt == QT.Q8_0) or (NATIVE_LOWBIT and qt in LOWBIT_TYPES)
+
 _PREFILL_LIMIT = 32 if os.getenv("ARMADA_Q8_PREFILL", "1") != "0" else 1
 MAX_THREADS = 32
 _cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
@@ -63,22 +76,30 @@ class PackedTensor:
     def multiply(self, x: FloatArray, expert: int | None = None) -> FloatArray:
         rows, cols = self.shape[-2:]
         batch = x.size // cols
-        if (NATIVE_Q8 and matvec is not None and 1 <= batch <= _PREFILL_LIMIT
-                and self.qt == gguf.GGMLQuantizationType.Q8_0):
+        if native_type(self.qt) and 1 <= batch <= _PREFILL_LIMIT:
+            assert self.qt is not None
+            code = int(self.qt)
+            def run(w: NDArray[np.uint8], v: FloatArray, y: FloatArray, n: int) -> None:
+                if self.qt == QT.Q8_0:
+                    assert matvec is not None
+                    matvec(w, v, y, n)
+                else:
+                    assert lowbit_matvec is not None
+                    lowbit_matvec(w, v, y, n, code)
             packed = self.data if expert is None else self.data[expert]
             vector = np.require(x, dtype=np.float32, requirements=["C", "A"])
             result = np.empty((rows, batch), dtype="f4")
             workers = min(q8_threads.get(), rows, max(1, packed.nbytes // (512 * 1024)))
             if workers == 1:
-                matvec(packed, vector, result, batch)
+                run(packed, vector, result, batch)
             else:
                 jobs = []
                 for i in range(workers):
                     span = slice(i * rows // workers, (i + 1) * rows // workers)
                     if i + 1 == workers:
-                        matvec(packed[span], vector, result[span], batch)
+                        run(packed[span], vector, result[span], batch)
                     else:
-                        jobs.append(_pool.submit(matvec, packed[span], vector, result[span], batch))
+                        jobs.append(_pool.submit(run, packed[span], vector, result[span], batch))
                 for job in jobs:
                     job.result()
             return result.T.reshape(*x.shape[:-1], rows)
