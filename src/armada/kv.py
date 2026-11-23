@@ -14,6 +14,7 @@ from .schema import FloatArray
 class KV:
     offset: int = 0
     layers: dict[int, tuple[FloatArray, FloatArray]] = field(default_factory=dict)
+    recurrent: dict[int, tuple[FloatArray, FloatArray]] = field(default_factory=dict)
 
     def append(self, layer: int, k: FloatArray, v: FloatArray, ctx: int) -> tuple[FloatArray, FloatArray]:
         end = self.offset + len(k)

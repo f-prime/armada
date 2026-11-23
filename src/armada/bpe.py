@@ -14,6 +14,9 @@ PATTERN = regex.compile(
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 LLAMA_PATTERN = regex.compile(PATTERN.pattern.replace(r"\p{N}|", r"\p{N}{1,3}|"))
+Q35_PATTERN = regex.compile(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 _visible = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
 _missing = [b for b in range(256) if b not in _visible]
 BYTE = {b: chr(b if b in _visible else 256 + _missing.index(b)) for b in range(256)}
@@ -32,6 +35,7 @@ class BPEModel(TypedDict):
 
 class Document(TypedDict):
     armada_llama3: NotRequired[bool]
+    armada_qwen35: NotRequired[bool]
     armada_bos: NotRequired[int]
     model: BPEModel
     added_tokens: list[Added]
@@ -39,9 +43,10 @@ class Document(TypedDict):
 
 def gg_tokenizer(meta: Fields) -> bytes:
     llama = meta.get("general.architecture") == "llama"
+    hybrid = meta.get("general.architecture") == "qwen35"
     check(
         meta["tokenizer.ggml.model"] == "gpt2"
-        and meta["tokenizer.ggml.pre"] == ("llama-bpe" if llama else "qwen2"),
+        and meta["tokenizer.ggml.pre"] == ("llama-bpe" if llama else "qwen35" if hybrid else "qwen2"),
         "unsupported GGUF byte-level BPE tokenizer",
     )
     words: list[str] = meta["tokenizer.ggml.tokens"]
@@ -61,6 +66,8 @@ def gg_tokenizer(meta: Fields) -> bytes:
     ]
     # Preserve the HF tokenizer JSON ABI for previous-version workers.
     extra: Fields = {}
+    if hybrid:
+        extra["armada_qwen35"] = True
     if llama:
         extra["armada_llama3"] = True
         if meta.get("tokenizer.ggml.add_bos_token", True):
@@ -81,7 +88,7 @@ def gg_tokenizer(meta: Fields) -> bytes:
                 pretokenizers=[
                     dict(
                         type="Split",
-                        pattern={"Regex": (LLAMA_PATTERN if llama else PATTERN).pattern},
+                         pattern={"Regex": (LLAMA_PATTERN if llama else Q35_PATTERN if hybrid else PATTERN).pattern},
                         behavior="Isolated",
                         invert=False,
                     ),
@@ -107,6 +114,7 @@ def gg_tokenizer(meta: Fields) -> bytes:
 class Tokenizer:
     def __init__(self, doc: Document) -> None:
         self.llama3 = doc.get("armada_llama3", False)
+        self.pattern = LLAMA_PATTERN if self.llama3 else Q35_PATTERN if doc.get("armada_qwen35") else PATTERN
         self.bos = doc.get("armada_bos")
         self.vocab = doc["model"]["vocab"]
         self.words = {i: w for w, i in self.vocab.items()}
@@ -131,7 +139,7 @@ class Tokenizer:
             if part in self.added:
                 ids.append(self.vocab[part])
                 continue
-            for word in (LLAMA_PATTERN if self.llama3 else PATTERN).findall(part):
+            for word in self.pattern.findall(part):
                 tokens = [BYTE[b] for b in word.encode()]
                 if self.llama3 and (encoded := "".join(tokens)) in self.vocab:
                     ids.append(self.vocab[encoded])

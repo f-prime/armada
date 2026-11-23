@@ -93,7 +93,7 @@ def gg_header(f: BinaryIO) -> tuple[Fields, list[Tensor]]:
 
 def gg_config(meta: Fields) -> QwenConfig:
     arch = meta.get("general.architecture")
-    check(arch in ("qwen3", "qwen3moe", "llama"), f"unsupported GGUF architecture: {arch}")
+    check(arch in ("qwen3", "qwen35", "qwen3moe", "llama"), f"unsupported GGUF architecture: {arch}")
     moe = arch == "qwen3moe"
     prefix = f"{arch}."
     p = {k.removeprefix(prefix): v for k, v in meta.items() if k.startswith(prefix)}
@@ -114,6 +114,18 @@ def gg_config(meta: Fields) -> QwenConfig:
         scale=p.get("expert_weights_scale", 1.0),
         vocab=len(meta["tokenizer.ggml.tokens"]),
     )
+    if arch == "qwen35":
+        interval = p.get("full_attention_interval", 4)
+        check(interval > 0, "invalid full attention interval")
+        c["recurrent"] = p.get("attention.recurrent_layers", [(i+1) % interval != 0 for i in range(c["layers"])])
+        c["rotary"] = p["rope.dimension_count"]
+        c["ssm_k_heads"] = p["ssm.group_count"]
+        c["ssm_heads"], c["ssm_dim"], c["conv"] = p["ssm.time_step_rank"], p["ssm.state_size"], p["ssm.conv_kernel"]
+        check(len(c["recurrent"]) == c["layers"] and 0 < c["rotary"] <= hd and not c["rotary"] % 2
+              and min(c["ssm_k_heads"], c["ssm_heads"], c["ssm_dim"], c["conv"]) > 0
+              and c["ssm_heads"] % c["ssm_k_heads"] == 0
+              and p["ssm.inner_size"] == c["ssm_heads"] * c["ssm_dim"]
+              and not p.get("nextn_predict_layers"), "unsupported Qwen3.5 recurrent or MTP layout")
     if arch == "llama":
         check(meta.get("tokenizer.ggml.pre") == "llama-bpe" and not p.get("expert_count"),
               "expected a dense Llama 3 GGUF with llama-bpe tokenizer")
@@ -123,7 +135,7 @@ def gg_config(meta: Fields) -> QwenConfig:
         and heads % c["kv"] == 0
         and (not moe or 0 < c["top"] <= c["experts"])
         and p.get("attention.value_length", hd) == hd
-        and p.get("rope.dimension_count", hd) == hd
+        and p.get("rope.dimension_count", hd) == c.get("rotary", hd)
         and p.get("rope.scaling.type", "none") == "none"
         and p.get("expert_weights_norm", True)
         and not p.get("attention.sliding_window"),
@@ -151,14 +163,26 @@ def gg_shapes(c: QwenConfig) -> Iterator[tuple[str, list[int], int]]:
         if e else dict(ffn_gate=[h, d], ffn_up=[h, d], ffn_down=[d, h])
     )
     for i in range(c["layers"]):
+        if "recurrent" in c and c["recurrent"][i]:
+            heads_ssm, width = c["ssm_heads"], c["ssm_dim"]
+            inner = heads_ssm * width
+            channels = inner + 2 * c["ssm_k_heads"] * width
+            for key, shape in dict(attn_norm=[d], post_attention_norm=[d], attn_gate=[inner,d],
+                                   attn_qkv=[channels,d], ssm_alpha=[heads_ssm,d], ssm_beta=[heads_ssm,d],
+                                   ssm_conv1d=[channels,c["conv"]], ssm_norm=[width],
+                                   ssm_out=[d,inner], **ffn).items():
+                yield f"blk.{i}.{key}.weight", shape, i
+            yield f"blk.{i}.ssm_a", [heads_ssm], i
+            yield f"blk.{i}.ssm_dt.bias", [heads_ssm], i
+            continue
         for key, shape in dict(
             attn_norm=[d],
-            attn_q=[heads * hd, d],
+            attn_q=[heads * hd * (2 if "recurrent" in c else 1), d],
             attn_k=[kv * hd, d],
             attn_v=[kv * hd, d],
             **({} if c.get("llama3") else dict(attn_q_norm=[hd], attn_k_norm=[hd])),
             attn_output=[d, heads * hd],
-            ffn_norm=[d],
+            **{"post_attention_norm" if "recurrent" in c else "ffn_norm": [d]},
             **ffn,
         ).items():
             yield f"blk.{i}.{key}.weight", shape, i
@@ -203,7 +227,7 @@ def import_gg(name: str, source: str, *, exclude_self: bool = False,
                     c = gg_config(meta)
                     nodes = online(exclude_self)[: c["layers"]]
                     for node in nodes:
-                        rpc(node, "llama3-ready" if c.get("llama3") else
+                        rpc(node, "qwen35-ready" if "recurrent" in c else "llama3-ready" if c.get("llama3") else
                             "qwen3-ready" if not c["experts"] else "qwen-ready")
                     owners = [
                         nodes[i * len(nodes) // c["layers"]] for i in range(c["layers"])
@@ -333,10 +357,10 @@ def gg_stage(
         (folder / "manifest.bin").read_bytes()
     ) if weights_cache is None else {}
 
-    def tensor(name: str) -> PackedTensor:
+    def tensor(name: str, suffix: str = ".weight") -> PackedTensor:
         if weights_cache is not None:
-            return weights_cache[name + ".weight"]
-        key, shape, code = manifest[name + ".weight"]
+            return weights_cache[name + suffix]
+        key, shape, code = manifest[name + suffix]
         return PackedTensor.load(folder / (ident(key) + ".bin"), tuple(shape), code)
 
     def mm(x: FloatArray, name: str, expert: int | None = None) -> FloatArray:
@@ -358,7 +382,8 @@ def gg_stage(
     hd, heads, kv = c["hd"], c["heads"], c["kv"]
     seq = len(x)
     offset = cache.offset if cache else 0
-    pos = np.outer(np.arange(offset, offset + seq), c["theta"] ** (-np.arange(0, hd, 2) / hd)).astype(
+    rot = c.get("rotary", hd)
+    pos = np.outer(np.arange(offset, offset + seq), c["theta"] ** (-np.arange(0, rot, 2) / rot)).astype(
         "f4"
     )[:, None, :]
 
@@ -368,16 +393,15 @@ def gg_stage(
             return np.stack((even * np.cos(pos) - odd * np.sin(pos),
                              even * np.sin(pos) + odd * np.cos(pos)), axis=-1).reshape(a.shape)
         # GGUF Qwen uses NeoX layout (two half-vectors), not llama2.c's interleaved pairs.
-        l, r = np.split(a, 2, axis=-1)
+        l, r = np.split(a[..., :rot], 2, axis=-1)
         return np.concatenate(
-            [l * np.cos(pos) - r * np.sin(pos), r * np.cos(pos) + l * np.sin(pos)],
+            [l * np.cos(pos) - r * np.sin(pos), r * np.cos(pos) + l * np.sin(pos), a[..., rot:]],
             axis=-1,
         )
 
-    for i in range(start, end):
-        pre = f"blk.{i}."
-        a = norm(x, pre + "attn_norm")
-        q = mm(a, pre + "attn_q").reshape(seq, heads, hd)
+    def full_attention(a: FloatArray, pre: str, i: int) -> FloatArray:
+        query = mm(a, pre + "attn_q").reshape(seq, heads, -1)
+        q = query[..., :hd]
         k = mm(a, pre + "attn_k").reshape(seq, kv, hd)
         if not c.get("llama3"):
             q, k = norm(q, pre + "attn_q_norm"), norm(k, pre + "attn_k_norm")
@@ -386,8 +410,49 @@ def gg_stage(
         if cache:
             k, v = cache.append(i, k, v, c["ctx"])
         a = attention(q, k, v)
-        x = x + mm(a.reshape(seq, -1), pre + "attn_output")
-        a = norm(x, pre + "ffn_norm")
+        if "recurrent" in c:
+            a *= sigmoid(query[..., hd:])
+        return mm(a.reshape(seq, -1), pre + "attn_output")
+
+    def sigmoid(a: FloatArray) -> FloatArray:
+        return np.asarray(1 / (1 + np.exp(-np.clip(a, -80, 80))), dtype="f4")
+
+    def linear_attention(a: FloatArray, pre: str, i: int) -> FloatArray:
+        h, w, taps = c["ssm_heads"], c["ssm_dim"], c["conv"]
+        raw = mm(a, pre + "attn_qkv")
+        saved = cache.recurrent.get(i) if cache else None
+        history, memory = saved if saved else (
+            np.zeros((taps-1, raw.shape[1]), dtype="f4"), np.zeros((h,w,w), dtype="f4"))
+        signal = np.concatenate((history, raw))
+        filt = tensor(pre + "ssm_conv1d").decode()
+        conv = sum((signal[j:j+seq] * filt[:,j] for j in range(1,taps)), signal[:seq] * filt[:,0])
+        kh = c["ssm_k_heads"]
+        q, k, v = np.split((conv * sigmoid(conv)).reshape(seq, 2*kh+h, w), [kh,2*kh], axis=1)
+        q /= np.sqrt((q*q).sum(axis=-1, keepdims=True) + c["eps"]) * np.sqrt(np.float32(w))
+        k /= np.sqrt((k*k).sum(axis=-1, keepdims=True) + c["eps"])
+        if kh != h:
+            q, k = np.tile(q, (1,h//kh,1)), np.tile(k, (1,h//kh,1))
+        beta = sigmoid(mm(a, pre + "ssm_beta"))
+        dt = mm(a, pre + "ssm_alpha") + tensor(pre + "ssm_dt", ".bias").decode()
+        decay = np.exp(np.logaddexp(0, dt) * tensor(pre + "ssm_a", "").decode())
+        out = np.empty_like(v)
+        for t in range(seq):
+            memory *= decay[t,:,None,None]
+            residual = (v[t] - np.einsum("hi,hij->hj", k[t], memory)) * beta[t,:,None]
+            memory += k[t,:,:,None] * residual[:,None,:]
+            out[t] = np.einsum("hi,hij->hj", q[t], memory)
+        if cache:
+            cache.recurrent[i] = signal[seq:].copy(), memory
+        z = mm(a, pre + "attn_gate").reshape(seq,h,w)
+        gated = norm(out, pre + "ssm_norm") * z * sigmoid(z)
+        return mm(gated.reshape(seq,-1), pre + "ssm_out")
+
+    for i in range(start, end):
+        pre = f"blk.{i}."
+        a = norm(x, pre + "attn_norm")
+        x = x + (linear_attention(a, pre, i) if "recurrent" in c and c["recurrent"][i]
+                 else full_attention(a, pre, i))
+        a = norm(x, pre + ("post_attention_norm" if "recurrent" in c else "ffn_norm"))
         if not c["experts"]:
             g = mm(a, pre + "ffn_gate")
             act = mm(a, pre + "ffn_up") * g / (1 + np.exp(-np.clip(g, -80, 80)))

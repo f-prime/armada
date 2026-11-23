@@ -12,6 +12,12 @@ type Fields = dict[str, Any]
 
 
 class QwenConfig(TypedDict):
+    recurrent: NotRequired[list[bool]]
+    rotary: NotRequired[int]
+    ssm_heads: NotRequired[int]
+    ssm_k_heads: NotRequired[int]
+    ssm_dim: NotRequired[int]
+    conv: NotRequired[int]
     llama3: NotRequired[bool]
     tied_output: NotRequired[bool]
     dim: int

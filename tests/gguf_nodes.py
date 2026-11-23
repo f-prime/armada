@@ -15,9 +15,10 @@ from llama_cpp import Llama
 from two_nodes import test
 
 
-def fixture(path: Path, dense: bool, llama: bool = False) -> str:
+def fixture(path: Path, dense: bool, llama: bool = False, hybrid: bool = False) -> str:
     rng = np.random.default_rng(203)
-    w = gguf.GGUFWriter(path, "llama" if llama else "qwen3" if dense else "qwen3moe", split_max_tensors=15)
+    arch = "qwen35" if hybrid else "llama" if llama else "qwen3" if dense else "qwen3moe"
+    w = gguf.GGUFWriter(path, arch, split_max_tensors=15)
     d, heads, kv, hd, n, e, k, h = 64, 4, 2, 32, 2, 4, 2, 64
     words = ["<eos>", "Ġ"] + [chr(i) for i in range(33, 127)] + ["On"]
     if llama:
@@ -36,7 +37,7 @@ def fixture(path: Path, dense: bool, llama: bool = False) -> str:
         layer_norm_rms_eps=1e-6,
         rope_freq_base=1000000.0,
         tokenizer_model="gpt2",
-        tokenizer_pre="llama-bpe" if llama else "qwen2",
+        tokenizer_pre="qwen35" if hybrid else "llama-bpe" if llama else "qwen2",
         token_list=words,
         token_merges=["O n"],
         token_types=[3] + [1] * (len(words) - 2) + [3 if llama else 1],
@@ -44,6 +45,12 @@ def fixture(path: Path, dense: bool, llama: bool = False) -> str:
         add_bos_token=llama,
     ).items():
         getattr(w, "add_" + key)(val)
+    if hybrid:
+        for key, val in {"ssm.state_size": 32, "ssm.group_count": 1, "ssm.time_step_rank": 2,
+                         "ssm.inner_size": 64, "ssm.conv_kernel": 4, "full_attention_interval": 2,
+                         "rope.dimension_count": 16}.items():
+            w.add_uint32("qwen35." + key, val)
+        w.add_array("qwen35.rope.dimension_sections", [3, 3, 2, 0])
     if not dense:
         w.add_expert_feed_forward_length(h)
         w.add_expert_count(e)
@@ -55,7 +62,7 @@ def fixture(path: Path, dense: bool, llama: bool = False) -> str:
             if len(shape) > 1
             else rng.uniform(0.8, 1.2, shape).astype("f4")
         )
-        if len(shape) > 1:
+        if len(shape) > 1 and not hybrid:
             qt = gguf.GGMLQuantizationType.Q8_0
             w.add_tensor(name + ".weight", gguf.quantize(data, qt), raw_dtype=qt)
         else:
@@ -66,16 +73,23 @@ def fixture(path: Path, dense: bool, llama: bool = False) -> str:
     if not dense or llama:
         weight("output", (len(words), d))
     for i in range(n):
-        for key, shape in dict(
-            attn_q=(heads * hd, d),
+        projections = dict(
+            attn_q=(heads * hd * (2 if hybrid else 1), d),
             attn_k=(kv * hd, d),
             attn_v=(kv * hd, d),
             **({} if llama else dict(attn_q_norm=(hd,), attn_k_norm=(hd,))),
             attn_norm=(d,),
             attn_output=(d, heads * hd),
-            ffn_norm=(d,),
-        ).items():
+        )
+        if hybrid and i == 0:
+            projections = dict(attn_norm=(d,), attn_qkv=(128,d), attn_gate=(64,d), ssm_alpha=(2,d),
+                               ssm_beta=(2,d), ssm_norm=(32,), ssm_out=(d,64))
+            w.add_tensor("blk.0.ssm_a", -np.ones(2, dtype="f4"))
+            w.add_tensor("blk.0.ssm_dt.bias", np.zeros(2, dtype="f4"))
+            w.add_tensor("blk.0.ssm_conv1d.weight", rng.normal(0,.5,(128,4)).astype("f4"))
+        for key, shape in projections.items():
             weight(f"blk.{i}.{key}", shape)
+        weight(f"blk.{i}." + ("post_attention_norm" if hybrid else "ffn_norm"), (d,))
         if dense:
             for key, shape in dict(gate=(h, d), up=(h, d), down=(d, h)).items():
                 weight(f"blk.{i}.ffn_{key}", shape)
@@ -91,9 +105,9 @@ def fixture(path: Path, dense: bool, llama: bool = False) -> str:
     return str(sorted(path.parent.glob("*.gguf"))[0])
 
 
-def compare(dense: bool, llama: bool = False) -> None:
+def compare(dense: bool, llama: bool = False, hybrid: bool = False) -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        path = fixture(Path(tmp) / "tiny.gguf", dense, llama)
+        path = fixture(Path(tmp) / "tiny.gguf", dense, llama, hybrid)
         with closing(
             Llama(
                 model_path=path, n_ctx=128, n_threads=1, logits_all=True, verbose=False
@@ -108,6 +122,7 @@ def compare(dense: bool, llama: bool = False) -> None:
             for prompt in [b"Once upon a time", b"input 123!", b"def foo(x):"]:
                 ids = llm.tokenize(prompt, add_bos=llama)
                 llm.n_tokens = 0
+                llm._ctx.kv_cache_clear()  # type: ignore[no-untyped-call]  # reset recurrent state too
                 llm.eval(ids)
                 probes.append((prompt, ids, llm.scores[len(ids) - 1].copy()))
 
@@ -141,6 +156,7 @@ def compare(dense: bool, llama: bool = False) -> None:
 
 
 if __name__ == "__main__":
+    compare(True, hybrid=True)
     compare(True)
     compare(False)
     compare(True, llama=True)

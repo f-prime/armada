@@ -10,7 +10,7 @@ faster generation.
 macOS has native RAM and GPU reporting; a physical mixed Linux/Mac inference
 benchmark is not yet published. GPU detection is for inventory, not execution.
 The NumPy backend supports legacy `llama2.c` completions and a subset of
-dense Llama 3, `qwen3` and `qwen3moe` GGUF v3 checkpoints. The chat API targets
+dense Llama 3, `qwen3`, `qwen35` (text), and `qwen3moe` GGUF v3 checkpoints. The chat API targets
 Qwen ChatML instruction models; arbitrary GGUF architectures and chat templates
 are not supported.
 
@@ -241,6 +241,8 @@ RoPE. Use `armada run` or `/v1/completions`; neither applies a chat template.
 
 ### Import dense Qwen3 GGUF
 
+See also [Qwen3.5-2B](#import-qwen35-2b-gguf) for hybrid recurrent models.
+
 Update Armada and restart the daemon on each peer. Use a direct GGUF file URL
 or local path; the tokenizer is included. For Qwen3-1.7B:
 
@@ -254,6 +256,25 @@ armada run qwen3-small 'The capital of France is' -n 8
 Use an unscaled-RoPE `qwen3` checkpoint with separate Q/K/V tensors. If the
 output projection is tied, both end peers store the embedding matrix (one copy
 when the same peer owns both ends).
+
+### Import Qwen3.5-2B GGUF
+
+Update and restart Armada on every layer owner first. Import the text GGUF,
+which contains its own tokenizer:
+
+```sh
+repo=https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main
+armada model add "$repo/Qwen3.5-2B-Q8_0.gguf" --name qwen35
+armada model warm qwen35
+armada run qwen35 'The capital of France is' -n 8 -v
+```
+
+The dense `qwen35` path supports text completions and text chat, including
+partial rotary attention and the causal convolution and recurrent state of
+Gated DeltaNet layers. The 2B Q8_0 checkpoint was tested on one and two workers.
+Use split Q/K/V projections for full attention and separate QKV/gate and
+alpha/beta projections for recurrent layers. Vision projectors, MoE
+(`qwen35moe`), and MTP blocks are not supported.
 
 ### Import Qwen3-Coder GGUF
 

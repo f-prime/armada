@@ -635,10 +635,12 @@ class Handler(BaseHTTPRequestHandler):
                                      diagnostics=b.get("diagnostics") is True, threads=b.get("q8_threads"))
                 chunks = completion_chunks(b["model"], model, tokens, stats)
             else:
-                check(model.get("backend") in ("qwen3", "qwen3moe"), "chat requires a Qwen instruction model; use /v1/completions for base models")
+                check(model.get("backend") in ("qwen3", "qwen35", "qwen3moe"), "chat requires a Qwen instruction model; use /v1/completions for base models")
                 check(b.get("n", 1) == 1, "only one completion is supported")
                 check(not b.get("stop"), "custom stop sequences are not supported")
                 prompt, names = chat.prompt(b)
+                if model.get("backend") == "qwen35":
+                    prompt += "<think>\n\n</think>\n\n"
                 count = b.get("max_completion_tokens", b.get("max_tokens", min(1024, model["qwen"]["ctx"])))
                 check(type(count) is int and count > 0, "expected a positive token limit")
                 tokens = generation(model, prompt, count, stats)
@@ -726,7 +728,7 @@ class Handler(BaseHTTPRequestHandler):
             return key_command(b)
         if op == "stats":
             return stats()
-        if op in ("qwen-ready", "qwen3-ready", "llama3-ready"):
+        if op in ("qwen-ready", "qwen3-ready", "qwen35-ready", "llama3-ready"):
             try:
                 import gguf
                 import regex
